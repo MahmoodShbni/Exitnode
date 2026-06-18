@@ -20,6 +20,11 @@
 
 ## بیلد
 
+به **Go 1.23 یا بالاتر** نیاز است. اولین بار وابستگی‌ها را resolve کن (go.sum می‌سازد):
+```
+go mod tidy
+```
+
 سرور (روی هر سیستمی قابل کراس‌کامپایل است):
 ```
 GOOS=linux GOARCH=amd64 go build -o relay-server ./server
@@ -30,10 +35,10 @@ GOOS=linux GOARCH=amd64 go build -o relay-server ./server
 GOOS=windows GOARCH=amd64 go build -o relay-client.exe ./client
 ```
 
-> اگر go نتوانست godivert را بگیرد، `GOPROXY=direct GOSUMDB=off go mod tidy`.
-
-کنار `relay-client.exe` باید این دو فایل باشند (از ریلیز رسمی WinDivert):
-`WinDivert.dll` و `WinDivert64.sys`. کلاینت باید **با دسترسی Administrator** اجرا شود.
+کنار `relay-client.exe` باید فایل‌های **WinDivert نسخه‌ی 2.x** باشند
+(از ریلیز رسمی WinDivert 2.2): `WinDivert.dll` و `WinDivert64.sys`.
+کلاینت با binding ‏`github.com/imgk/divert-go` کار می‌کند که فقط با WinDivert 2.x
+سازگار است؛ نسخه‌ی 1.x باعث panic می‌شود. کلاینت باید **با دسترسی Administrator** اجرا شود.
 
 ## اجرا
 

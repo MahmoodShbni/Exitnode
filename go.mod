@@ -1,9 +1,9 @@
 module relay
 
-go 1.22
+go 1.23
 
-// On Windows, run `go get github.com/williamfhe/godivert` to add the
-// WinDivert binding used by the client. It is windows-only and will be
-// skipped on Linux builds thanks to the build tag in client/main.go.
+// WinDivert 2.x binding (loads WinDivert.dll at runtime; windows-only).
+// It is skipped on Linux builds thanks to the build tag in client/main.go.
+require github.com/imgk/divert-go v0.0.0-20250406082804-3cb755167a0a
 
-require github.com/williamfhe/godivert v0.0.0-20181229124620-a48c5b872c73
+require golang.org/x/sys v0.31.0 // indirect

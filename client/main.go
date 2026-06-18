@@ -1,16 +1,16 @@
 //go:build windows
 
-// Command relay-client is the Windows side. It uses WinDivert to grab
-// ONLY the outbound UDP that goes to the game server, tunnels it through
-// your relay, and re-injects the replies so the game thinks they came
-// straight from the server.
+// Command relay-client is the Windows side. It uses WinDivert 2.x (via the
+// imgk/divert-go binding) to grab ONLY the outbound UDP that goes to the
+// game server, tunnels it through your relay, and re-injects the replies
+// so the game thinks they came straight from the server.
 //
-// TCP and every other process are never touched — they keep using the
-// normal internet path.
+// TCP and every other process are never touched.
 //
-// Requirements next to the .exe:
+// Requirements next to the .exe (from the official WinDivert 2.2 release):
 //   - WinDivert.dll
-//   - WinDivert64.sys   (driver, auto-loaded; needs Administrator)
+//   - WinDivert64.sys
+// Run as Administrator.
 //
 // Build (from Linux or Windows):
 //   GOOS=windows GOARCH=amd64 go build -o relay-client.exe ./client
@@ -27,7 +27,19 @@ import (
 
 	"relay/proto"
 
-	"github.com/williamfhe/godivert"
+	divert "github.com/imgk/divert-go"
+)
+
+// WinDivert 2.x address Flags bit layout (one byte).
+const (
+	flagSniffed     = 1 << 0
+	flagOutbound    = 1 << 1
+	flagLoopback    = 1 << 2
+	flagImpostor    = 1 << 3
+	flagIPv6        = 1 << 4
+	flagIPChecksum  = 1 << 5
+	flagTCPChecksum = 1 << 6
+	flagUDPChecksum = 1 << 7
 )
 
 var (
@@ -64,7 +76,6 @@ func main() {
 		log.Fatal("invalid -game IP (IPv4 only)")
 	}
 
-	// Socket to the relay. We send encapsulated packets here and read replies.
 	raddr, err := net.ResolveUDPAddr("udp", *relayAddr)
 	if err != nil {
 		log.Fatalf("resolve relay: %v", err)
@@ -77,39 +88,34 @@ func main() {
 	_ = relayConn.SetWriteBuffer(4 << 20)
 
 	// Capture ONLY outbound UDP headed to the game server.
-	// Note: WinDivert filters on packet fields, not process. We narrow to
-	// the game IP; that is enough because no other process talks to it.
 	filter := fmt.Sprintf("outbound and udp and ip.DstAddr == %s", *gameIP)
-	wd, err := godivert.NewWinDivertHandle(filter)
+	h, err := divert.Open(filter, divert.LayerNetwork, divert.PriorityDefault, divert.FlagDefault)
 	if err != nil {
-		log.Fatalf("open WinDivert (run as Administrator?): %v", err)
+		log.Fatalf("open WinDivert (run as Administrator? WinDivert 2.x dll/sys present?): %v", err)
 	}
-	defer wd.Close()
+	defer h.Close()
 
 	dedup := proto.NewDedup(*dedupSize)
-
 	log.Printf("relaying %s UDP via %s (redundancy=%d)", *gameIP, *relayAddr, *redundancy)
 
-	// Reply path: relay -> here -> re-inject into the stack as inbound.
-	go replyLoop(wd, relayConn, dedup)
-
-	// Capture path: game -> here -> relay.
-	captureLoop(wd, relayConn, gIP)
+	go replyLoop(h, relayConn, dedup)
+	captureLoop(h, relayConn, gIP)
 }
 
 // captureLoop reads outbound game packets and tunnels them to the relay.
-func captureLoop(wd *godivert.WinDivertHandle, relayConn *net.UDPConn, gameIP net.IP) {
+func captureLoop(h *divert.Handle, relayConn *net.UDPConn, gameIP net.IP) {
+	buf := make([]byte, 65535)
+	var addr divert.Address
 	for {
-		pkt, err := wd.Recv()
+		n, err := h.Recv(buf, &addr)
 		if err != nil {
 			log.Printf("recv: %v", err)
 			continue
 		}
-
-		raw := pkt.Raw
+		raw := buf[:n]
 		ihl := int(raw[0]&0x0f) * 4
 		if len(raw) < ihl+8 {
-			_ = sendOriginal(wd, pkt)
+			_, _ = h.Send(raw, &addr) // not ours to mangle; pass through
 			continue
 		}
 		srcIP := net.IPv4(raw[12], raw[13], raw[14], raw[15])
@@ -117,15 +123,15 @@ func captureLoop(wd *godivert.WinDivertHandle, relayConn *net.UDPConn, gameIP ne
 		dstPort := binary.BigEndian.Uint16(raw[ihl+2 : ihl+4])
 		payload := raw[ihl+8:]
 
-		// Remember how to rebuild the reply for this flow.
+		net4 := addr.Network()
 		tmplMu.Lock()
 		templates[srcPort] = &flowTemplate{
 			localIP:   srcIP,
 			localPort: srcPort,
 			gameIP:    gameIP,
 			gamePort:  dstPort,
-			ifIdx:     pkt.Addr.IfIdx,
-			subIfIdx:  pkt.Addr.SubIfIdx,
+			ifIdx:     net4.InterfaceIndex,
+			subIfIdx:  net4.SubInterfaceIndex,
 		}
 		tmplMu.Unlock()
 
@@ -138,21 +144,18 @@ func captureLoop(wd *godivert.WinDivertHandle, relayConn *net.UDPConn, gameIP ne
 			LocalPort: srcPort,
 			Payload:   payload,
 		})
-
-		// Redundancy: fire the same packet (same seq) N times at the relay.
 		for i := 0; i < *redundancy; i++ {
 			if _, err := relayConn.Write(enc); err != nil {
 				log.Printf("to relay: %v", err)
 				break
 			}
 		}
-		// Do NOT re-send the original out the normal path — the relay
-		// delivers it. The captured packet is simply dropped here.
+		// Original is dropped (not re-sent): the relay delivers it.
 	}
 }
 
 // replyLoop reads encapsulated replies and injects them as inbound.
-func replyLoop(wd *godivert.WinDivertHandle, relayConn *net.UDPConn, dedup *proto.Dedup) {
+func replyLoop(h *divert.Handle, relayConn *net.UDPConn, dedup *proto.Dedup) {
 	buf := make([]byte, 65535)
 	for {
 		n, err := relayConn.Read(buf)
@@ -165,59 +168,62 @@ func replyLoop(wd *godivert.WinDivertHandle, relayConn *net.UDPConn, dedup *prot
 			continue
 		}
 		if dedup.Seen(pkt.Seq) {
-			continue // duplicate copy from redundancy
+			continue
 		}
 
 		tmplMu.RLock()
 		tmpl := templates[pkt.LocalPort]
 		tmplMu.RUnlock()
 		if tmpl == nil {
-			continue // no matching flow seen yet
+			continue
 		}
 
 		raw := buildInbound(tmpl, pkt.Payload)
-		inbound := &godivert.Packet{
-			Raw: raw,
-			// Data bit0 = direction; 1 => inbound. Reuse the capturing
-			// interface indices so the injected packet routes correctly.
-			Addr:      &godivert.WinDivertAddress{IfIdx: tmpl.ifIdx, SubIfIdx: tmpl.subIfIdx, Data: 0x1},
-			PacketLen: uint(len(raw)),
-		}
-		if _, err := wd.Send(inbound); err != nil {
+
+		var a divert.Address
+		a.SetLayer(divert.LayerNetwork)
+		a.SetEvent(divert.EventNetworkPacket)
+		// Inbound (Outbound bit cleared); checksums are valid in-packet.
+		a.Flags = flagIPChecksum | flagUDPChecksum
+		ne := a.Network()
+		ne.InterfaceIndex = tmpl.ifIdx
+		ne.SubInterfaceIndex = tmpl.subIfIdx
+
+		if _, err := h.Send(raw, &a); err != nil {
 			log.Printf("inject: %v", err)
 		}
 	}
 }
 
 // buildInbound crafts an IPv4+UDP packet that looks like it came FROM the
-// game server TO the local client, carrying payload. UDP checksum is set
-// to 0, which is legal for IPv4 and accepted by the stack.
+// game server TO the local client, carrying payload, with valid checksums.
 func buildInbound(t *flowTemplate, payload []byte) []byte {
 	const ihl = 20
 	udpLen := 8 + len(payload)
 	total := ihl + udpLen
 	b := make([]byte, total)
 
-	// --- IPv4 header ---
-	b[0] = 0x45 // version 4, IHL 5
-	b[1] = 0x00 // DSCP/ECN
+	// IPv4 header
+	b[0] = 0x45
+	b[1] = 0x00
 	binary.BigEndian.PutUint16(b[2:4], uint16(total))
-	binary.BigEndian.PutUint16(b[4:6], 0) // id
-	binary.BigEndian.PutUint16(b[6:8], 0) // flags/frag
-	b[8] = 64                              // TTL
-	b[9] = 17                              // protocol = UDP
-	// src = game server, dst = local
-	copy(b[12:16], t.gameIP.To4())
-	copy(b[16:20], t.localIP.To4())
+	binary.BigEndian.PutUint16(b[4:6], 0)
+	binary.BigEndian.PutUint16(b[6:8], 0)
+	b[8] = 64 // TTL
+	b[9] = 17 // UDP
+	copy(b[12:16], t.gameIP.To4())  // src = game server
+	copy(b[16:20], t.localIP.To4()) // dst = local
 	binary.BigEndian.PutUint16(b[10:12], ipChecksum(b[:ihl]))
 
-	// --- UDP header ---
-	binary.BigEndian.PutUint16(b[20:22], t.gamePort)  // src port = game
-	binary.BigEndian.PutUint16(b[22:24], t.localPort) // dst port = local
+	// UDP header
+	binary.BigEndian.PutUint16(b[20:22], t.gamePort)
+	binary.BigEndian.PutUint16(b[22:24], t.localPort)
 	binary.BigEndian.PutUint16(b[24:26], uint16(udpLen))
-	binary.BigEndian.PutUint16(b[26:28], 0) // checksum 0 = disabled (legal for IPv4)
-
+	binary.BigEndian.PutUint16(b[26:28], 0) // checksum placeholder
 	copy(b[28:], payload)
+
+	csum := udpChecksum(t.gameIP, t.localIP, b[20:])
+	binary.BigEndian.PutUint16(b[26:28], csum)
 	return b
 }
 
@@ -232,9 +238,29 @@ func ipChecksum(h []byte) uint16 {
 	return ^uint16(sum)
 }
 
-// sendOriginal re-emits a captured packet unchanged (used when we decide
-// not to tunnel it).
-func sendOriginal(wd *godivert.WinDivertHandle, pkt *godivert.Packet) error {
-	_, err := wd.Send(pkt)
-	return err
+// udpChecksum computes the UDP checksum over the pseudo-header + udp segment.
+func udpChecksum(srcIP, dstIP net.IP, udp []byte) uint16 {
+	s := srcIP.To4()
+	d := dstIP.To4()
+	var sum uint32
+	sum += uint32(s[0])<<8 | uint32(s[1])
+	sum += uint32(s[2])<<8 | uint32(s[3])
+	sum += uint32(d[0])<<8 | uint32(d[1])
+	sum += uint32(d[2])<<8 | uint32(d[3])
+	sum += uint32(17)
+	sum += uint32(len(udp))
+	for i := 0; i+1 < len(udp); i += 2 {
+		sum += uint32(udp[i])<<8 | uint32(udp[i+1])
+	}
+	if len(udp)%2 == 1 {
+		sum += uint32(udp[len(udp)-1]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	c := ^uint16(sum)
+	if c == 0 {
+		c = 0xffff // 0 would mean "no checksum"
+	}
+	return c
 }
