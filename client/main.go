@@ -1,19 +1,6 @@
 //go:build windows
 
-// Command relay-client is the Windows side. It uses WinDivert 2.x (via the
-// imgk/divert-go binding) to grab ONLY the outbound UDP that goes to the
-// game server, tunnels it through your relay, and re-injects the replies
-// so the game thinks they came straight from the server.
-//
-// TCP and every other process are never touched.
-//
-// Requirements next to the .exe (from the official WinDivert 2.2 release):
-//   - WinDivert.dll
-//   - WinDivert64.sys
-// Run as Administrator.
-//
-// Build (from Linux or Windows):
-//   GOOS=windows GOARCH=amd64 go build -o relay-client.exe ./client
+// Command relay-client is the Windows side.
 package main
 
 import (
@@ -22,15 +9,19 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
+	"time"
+	"unsafe"
 
 	"relay/proto"
 
 	divert "github.com/imgk/divert-go"
+	"golang.org/x/sys/windows"
 )
 
-// WinDivert 2.x address Flags bit layout (one byte).
 const (
 	flagSniffed     = 1 << 0
 	flagOutbound    = 1 << 1
@@ -40,22 +31,36 @@ const (
 	flagIPChecksum  = 1 << 5
 	flagTCPChecksum = 1 << 6
 	flagUDPChecksum = 1 << 7
+
+	// Constants for GetExtendedUdpTable
+	AF_INET             = 2
+	UDP_TABLE_OWNER_PID = 1
 )
 
 var (
+	modiphlpapi             = syscall.NewLazyDLL("iphlpapi.dll")
+	procGetExtendedUdpTable = modiphlpapi.NewProc("GetExtendedUdpTable")
+)
+
+type MIB_UDPROW_OWNER_PID struct {
+	LocalAddr uint32
+	LocalPort uint32
+	OwningPid uint32
+}
+
+var (
 	relayAddr  = flag.String("relay", "", "relay server address host:port (required)")
-	gameIP     = flag.String("game", "", "game server IP to capture, e.g. 1.2.3.4 (required)")
+	gameIP     = flag.String("game", "", "game server IP to capture (e.g. 1.2.3.4)")
+	exeName    = flag.String("exe", "", "process name to capture (e.g. cs2.exe)")
 	redundancy = flag.Int("redundancy", 2, "send each game packet this many times to the relay")
 	dedupSize  = flag.Int("dedup", 4096, "duplicate-detection window for replies")
 )
 
-// flowTemplate remembers the addressing of an outbound packet so we can
-// reconstruct the matching inbound packet for re-injection.
+// flowTemplate now only needs to remember local machine bindings.
+// Remote game IP/Port are dynamic!
 type flowTemplate struct {
 	localIP   net.IP
 	localPort uint16
-	gameIP    net.IP
-	gamePort  uint16
 	ifIdx     uint32
 	subIfIdx  uint32
 }
@@ -63,17 +68,20 @@ type flowTemplate struct {
 var (
 	seqCounter uint32
 	tmplMu     sync.RWMutex
-	templates  = map[uint16]*flowTemplate{} // keyed by local source port
+	templates  = map[uint16]*flowTemplate{}
+
+	gamePorts atomic.Pointer[map[uint16]bool]
 )
 
 func main() {
 	flag.Parse()
-	if *relayAddr == "" || *gameIP == "" {
-		log.Fatal("usage: relay-client -relay host:port -game <game-server-ip>")
+	if *relayAddr == "" {
+		log.Fatal("error: -relay address is required")
 	}
-	gIP := net.ParseIP(*gameIP).To4()
-	if gIP == nil {
-		log.Fatal("invalid -game IP (IPv4 only)")
+
+	// Mutual Exclusivity: Only ONE mode should be active
+	if (*gameIP == "" && *exeName == "") || (*gameIP != "" && *exeName != "") {
+		log.Fatal("usage error: strictly provide EITHER -game <ip> OR -exe <process.exe>")
 	}
 
 	raddr, err := net.ResolveUDPAddr("udp", *relayAddr)
@@ -87,49 +95,71 @@ func main() {
 	_ = relayConn.SetReadBuffer(4 << 20)
 	_ = relayConn.SetWriteBuffer(4 << 20)
 
-	// Capture ONLY outbound UDP headed to the game server.
-	filter := fmt.Sprintf("outbound and udp and ip.DstAddr == %s", *gameIP)
+	var filter string
+	if *gameIP != "" {
+		// --- Mode 1: Static IP Binding ---
+		gIP := net.ParseIP(*gameIP).To4()
+		if gIP == nil {
+			log.Fatal("invalid -game IP (IPv4 only)")
+		}
+		filter = fmt.Sprintf("outbound and udp and ip.DstAddr == %s", *gameIP)
+		log.Printf("[Mode: IP] relalying traffic bound ONLY to %s via %s (redundancy=%d)", *gameIP, *relayAddr, *redundancy)
+	} else {
+		// --- Mode 2: Process-Aware Binding ---
+		filter = "outbound and udp"
+		empty := make(map[uint16]bool)
+		gamePorts.Store(&empty)
+		go syncGamePorts(*exeName)
+		log.Printf("[Mode: Process] relaying ALL udp traffic for '%s' via %s (redundancy=%d)", *exeName, *relayAddr, *redundancy)
+	}
+
 	h, err := divert.Open(filter, divert.LayerNetwork, divert.PriorityDefault, divert.FlagDefault)
 	if err != nil {
-		log.Fatalf("open WinDivert (run as Administrator? WinDivert 2.x dll/sys present?): %v", err)
+		log.Fatalf("open WinDivert: %v", err)
 	}
 	defer h.Close()
 
 	dedup := proto.NewDedup(*dedupSize)
-	log.Printf("relaying %s UDP via %s (redundancy=%d)", *gameIP, *relayAddr, *redundancy)
-
 	go replyLoop(h, relayConn, dedup)
-	captureLoop(h, relayConn, gIP)
+	captureLoop(h, relayConn)
 }
 
-// captureLoop reads outbound game packets and tunnels them to the relay.
-func captureLoop(h *divert.Handle, relayConn *net.UDPConn, gameIP net.IP) {
+func captureLoop(h *divert.Handle, relayConn *net.UDPConn) {
 	buf := make([]byte, 65535)
 	var addr divert.Address
 	for {
 		n, err := h.Recv(buf, &addr)
 		if err != nil {
-			log.Printf("recv: %v", err)
 			continue
 		}
 		raw := buf[:n]
 		ihl := int(raw[0]&0x0f) * 4
 		if len(raw) < ihl+8 {
-			_, _ = h.Send(raw, &addr) // not ours to mangle; pass through
+			_, _ = h.Send(raw, &addr)
 			continue
 		}
+		
 		srcIP := net.IPv4(raw[12], raw[13], raw[14], raw[15])
+		dstIP := net.IPv4(raw[16], raw[17], raw[18], raw[19]) // Dynamically extract game server IP!
 		srcPort := binary.BigEndian.Uint16(raw[ihl : ihl+2])
 		dstPort := binary.BigEndian.Uint16(raw[ihl+2 : ihl+4])
 		payload := raw[ihl+8:]
+
+		// If running in Process Mode, check if the packet belongs to our process
+		if *exeName != "" {
+			pm := gamePorts.Load()
+			if pm != nil && !(*pm)[srcPort] {
+				// Not our game process. Re-inject intact to standard internet.
+				_, _ = h.Send(raw, &addr)
+				continue
+			}
+		}
 
 		net4 := addr.Network()
 		tmplMu.Lock()
 		templates[srcPort] = &flowTemplate{
 			localIP:   srcIP,
 			localPort: srcPort,
-			gameIP:    gameIP,
-			gamePort:  dstPort,
 			ifIdx:     net4.InterfaceIndex,
 			subIfIdx:  net4.SubInterfaceIndex,
 		}
@@ -139,28 +169,134 @@ func captureLoop(h *divert.Handle, relayConn *net.UDPConn, gameIP net.IP) {
 		enc := proto.Encode(&proto.Packet{
 			Flags:     proto.FlagData,
 			Seq:       seq,
-			Addr:      gameIP,
+			Addr:      dstIP,   // Encapsulate dynamic destination
 			Port:      dstPort,
 			LocalPort: srcPort,
 			Payload:   payload,
 		})
+		
 		for i := 0; i < *redundancy; i++ {
 			if _, err := relayConn.Write(enc); err != nil {
-				log.Printf("to relay: %v", err)
 				break
 			}
 		}
-		// Original is dropped (not re-sent): the relay delivers it.
 	}
 }
 
-// replyLoop reads encapsulated replies and injects them as inbound.
+// ---------------------------------------------------------
+// Process-Aware Logic (Windows API)
+// ---------------------------------------------------------
+
+func syncGamePorts(processName string) {
+	for {
+		pids := getPIDsByProcessName(processName)
+		newPorts := make(map[uint16]bool)
+
+		if len(pids) > 0 {
+			rows, err := getUDPTable()
+			if err == nil {
+				for _, row := range rows {
+					if pids[row.OwningPid] {
+						port := parsePort(row.LocalPort)
+						newPorts[port] = true
+					}
+				}
+			}
+		}
+
+		gamePorts.Store(&newPorts)
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func getPIDsByProcessName(name string) map[uint32]bool {
+	pids := make(map[uint32]bool)
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return pids
+	}
+	defer windows.CloseHandle(snapshot)
+
+	var pe32 windows.ProcessEntry32
+	pe32.Size = uint32(unsafe.Sizeof(pe32))
+
+	err = windows.Process32First(snapshot, &pe32)
+	for err == nil {
+		szExeFile := windows.UTF16ToString(pe32.ExeFile[:])
+		if strings.EqualFold(szExeFile, name) {
+			pids[pe32.ProcessID] = true
+		}
+		err = windows.Process32Next(snapshot, &pe32)
+	}
+	return pids
+}
+
+func getUDPTable() ([]MIB_UDPROW_OWNER_PID, error) {
+	var size uint32
+	procGetExtendedUdpTable.Call(
+		0,
+		uintptr(unsafe.Pointer(&size)),
+		0,
+		AF_INET,
+		UDP_TABLE_OWNER_PID,
+		0,
+	)
+
+	if size == 0 {
+		return nil, nil
+	}
+
+	buf := make([]byte, size)
+	ret, _, _ := procGetExtendedUdpTable.Call(
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(unsafe.Pointer(&size)),
+		0,
+		AF_INET,
+		UDP_TABLE_OWNER_PID,
+		0,
+	)
+
+	if ret != 0 {
+		return nil, fmt.Errorf("error: %d", ret)
+	}
+	if len(buf) < 4 {
+		return nil, nil
+	}
+
+	numEntries := binary.LittleEndian.Uint32(buf[0:4])
+	var rows []MIB_UDPROW_OWNER_PID
+	offset := uint32(4)
+	rowSize := uint32(12)
+
+	for i := uint32(0); i < numEntries; i++ {
+		if offset+rowSize > uint32(len(buf)) {
+			break
+		}
+		row := MIB_UDPROW_OWNER_PID{
+			LocalAddr: binary.LittleEndian.Uint32(buf[offset : offset+4]),
+			LocalPort: binary.LittleEndian.Uint32(buf[offset+4 : offset+8]),
+			OwningPid: binary.LittleEndian.Uint32(buf[offset+8 : offset+12]),
+		}
+		rows = append(rows, row)
+		offset += rowSize
+	}
+	return rows, nil
+}
+
+func parsePort(dwPort uint32) uint16 {
+	p := uint16(dwPort)
+	return (p >> 8) | (p << 8)
+}
+
+// ---------------------------------------------------------
+// Original Inbound Injection Logic
+// ---------------------------------------------------------
+
 func replyLoop(h *divert.Handle, relayConn *net.UDPConn, dedup *proto.Dedup) {
 	buf := make([]byte, 65535)
 	for {
 		n, err := relayConn.Read(buf)
 		if err != nil {
-			log.Printf("from relay: %v", err)
 			continue
 		}
 		pkt, err := proto.Decode(buf[:n])
@@ -178,51 +314,45 @@ func replyLoop(h *divert.Handle, relayConn *net.UDPConn, dedup *proto.Dedup) {
 			continue
 		}
 
-		raw := buildInbound(tmpl, pkt.Payload)
+		// Inject dynamic pkt.Addr and pkt.Port from the relay response!
+		raw := buildInbound(tmpl, pkt.Addr, pkt.Port, pkt.Payload)
 
 		var a divert.Address
 		a.SetLayer(divert.LayerNetwork)
 		a.SetEvent(divert.EventNetworkPacket)
-		// Inbound (Outbound bit cleared); checksums are valid in-packet.
 		a.Flags = flagIPChecksum | flagUDPChecksum
 		ne := a.Network()
 		ne.InterfaceIndex = tmpl.ifIdx
 		ne.SubInterfaceIndex = tmpl.subIfIdx
 
-		if _, err := h.Send(raw, &a); err != nil {
-			log.Printf("inject: %v", err)
-		}
+		_, _ = h.Send(raw, &a)
 	}
 }
 
-// buildInbound crafts an IPv4+UDP packet that looks like it came FROM the
-// game server TO the local client, carrying payload, with valid checksums.
-func buildInbound(t *flowTemplate, payload []byte) []byte {
+func buildInbound(t *flowTemplate, remoteIP net.IP, remotePort uint16, payload []byte) []byte {
 	const ihl = 20
 	udpLen := 8 + len(payload)
 	total := ihl + udpLen
 	b := make([]byte, total)
 
-	// IPv4 header
 	b[0] = 0x45
 	b[1] = 0x00
 	binary.BigEndian.PutUint16(b[2:4], uint16(total))
 	binary.BigEndian.PutUint16(b[4:6], 0)
 	binary.BigEndian.PutUint16(b[6:8], 0)
-	b[8] = 64 // TTL
-	b[9] = 17 // UDP
-	copy(b[12:16], t.gameIP.To4())  // src = game server
-	copy(b[16:20], t.localIP.To4()) // dst = local
+	b[8] = 64
+	b[9] = 17
+	copy(b[12:16], remoteIP.To4())
+	copy(b[16:20], t.localIP.To4())
 	binary.BigEndian.PutUint16(b[10:12], ipChecksum(b[:ihl]))
 
-	// UDP header
-	binary.BigEndian.PutUint16(b[20:22], t.gamePort)
+	binary.BigEndian.PutUint16(b[20:22], remotePort)
 	binary.BigEndian.PutUint16(b[22:24], t.localPort)
 	binary.BigEndian.PutUint16(b[24:26], uint16(udpLen))
-	binary.BigEndian.PutUint16(b[26:28], 0) // checksum placeholder
+	binary.BigEndian.PutUint16(b[26:28], 0)
 	copy(b[28:], payload)
 
-	csum := udpChecksum(t.gameIP, t.localIP, b[20:])
+	csum := udpChecksum(remoteIP, t.localIP, b[20:])
 	binary.BigEndian.PutUint16(b[26:28], csum)
 	return b
 }
@@ -238,7 +368,6 @@ func ipChecksum(h []byte) uint16 {
 	return ^uint16(sum)
 }
 
-// udpChecksum computes the UDP checksum over the pseudo-header + udp segment.
 func udpChecksum(srcIP, dstIP net.IP, udp []byte) uint16 {
 	s := srcIP.To4()
 	d := dstIP.To4()
@@ -260,7 +389,7 @@ func udpChecksum(srcIP, dstIP net.IP, udp []byte) uint16 {
 	}
 	c := ^uint16(sum)
 	if c == 0 {
-		c = 0xffff // 0 would mean "no checksum"
+		c = 0xffff
 	}
 	return c
 }
