@@ -68,10 +68,14 @@ var (
 	templates  = map[uint16]*flowTemplate{}
 )
 
+// سیستم ردیابی پورت هوشمند و غیرمسدودکننده
 type PortTracker struct {
 	mu       sync.RWMutex
 	ports    map[uint16]bool
 	gamePIDs map[uint32]bool
+
+	updateMu sync.Mutex
+	lastSync time.Time
 }
 
 var pt = &PortTracker{
@@ -129,15 +133,12 @@ func main() {
 	dedup := proto.NewDedup(*dedupSize)
 	go replyLoop(h, relayConn, dedup)
 	
-	// Start high-performance capture loop
 	captureLoop(h, relayConn)
 }
 
 func captureLoop(h *divert.Handle, relayConn *net.UDPConn) {
-	// Create a buffered channel (queue) to prevent dropping packets
 	jobs := make(chan packetJob, 4096)
 	
-	// Spawn 16 concurrent workers to process packets asynchronously
 	for i := 0; i < 16; i++ {
 		go outboundWorker(h, relayConn, jobs)
 	}
@@ -145,17 +146,14 @@ func captureLoop(h *divert.Handle, relayConn *net.UDPConn) {
 	buf := make([]byte, 65535)
 	var addr divert.Address
 	
-	// WinDivert loop (Zero blocking)
 	for {
 		n, err := h.Recv(buf, &addr)
 		if err != nil {
 			continue
 		}
 		
-		// تبدیل uint به int برای رفع خطای Type-Checking
 		nInt := int(n)
 		
-		// Very fast check before memory allocation
 		if nInt < 20 || buf[0]>>4 != 4 {
 			_, _ = h.Send(buf[:nInt], &addr)
 			continue
@@ -166,7 +164,6 @@ func captureLoop(h *divert.Handle, relayConn *net.UDPConn) {
 			continue
 		}
 
-		// Copy data and send to queue instantly
 		rawCopy := make([]byte, nInt)
 		copy(rawCopy, buf[:nInt])
 		jobs <- packetJob{raw: rawCopy, addr: addr}
@@ -188,7 +185,7 @@ func processOutbound(h *divert.Handle, relayConn *net.UDPConn, raw []byte, addr 
 	payload := raw[ihl+8:]
 
 	if *exeName != "" {
-		if !isGamePort(srcPort) {
+		if !isGamePacket(srcPort, dstPort) {
 			_, _ = h.Send(raw, &addr)
 			return
 		}
@@ -220,7 +217,7 @@ func processOutbound(h *divert.Handle, relayConn *net.UDPConn, raw []byte, addr 
 }
 
 // ---------------------------------------------------------
-// Process-Aware Logic (Thread-safe & Robust)
+// Process-Aware Logic (Fast-Path & Robust Polling)
 // ---------------------------------------------------------
 
 func syncPIDs(processName string) {
@@ -232,42 +229,85 @@ func syncPIDs(processName string) {
 			pt.ports = make(map[uint16]bool)
 		}
 		pt.mu.Unlock()
+
+		// بروزرسانی نقشه پورت‌ها در پس‌زمینه
+		if len(pids) > 0 {
+			pt.refresh()
+		}
+
 		time.Sleep(2 * time.Second)
 	}
 }
 
-func isGamePort(port uint16) bool {
-	pt.mu.RLock()
-	isGame, exists := pt.ports[port]
-	pt.mu.RUnlock()
+// تابع اصلی بروزرسانی جدول ویندوز (فقط یک‌بار در لحظه اجرا می‌شود)
+func (pt *PortTracker) refresh() {
+	pt.updateMu.Lock()
+	defer pt.updateMu.Unlock()
 
-	if exists {
-		return isGame
-	}
-
-	pt.mu.Lock()
-	defer pt.mu.Unlock()
-
-	if isGame, exists = pt.ports[port]; exists {
-		return isGame
+	// جلوگیری از اجرای بی‌مورد در کسری از ثانیه
+	if time.Since(pt.lastSync) < 50*time.Millisecond {
+		return
 	}
 
 	rows, err := getUDPTable()
 	if err == nil {
 		newMap := make(map[uint16]bool)
+		
+		pt.mu.RLock()
+		pids := pt.gamePIDs
+		pt.mu.RUnlock()
+
 		for _, row := range rows {
 			p := parsePort(row.LocalPort)
-			newMap[p] = pt.gamePIDs[row.OwningPid]
+			newMap[p] = pids[row.OwningPid]
 		}
-		pt.ports = newMap
 		
-		if val, ok := pt.ports[port]; ok {
-			return val
-		}
+		pt.mu.Lock()
+		pt.ports = newMap
+		pt.mu.Unlock()
+		pt.lastSync = time.Now()
+	}
+}
+
+// هوش مصنوعی تشخیص بسته‌های بازی
+func isGamePacket(srcPort, dstPort uint16) bool {
+	// 1. بررسی بسیار سریع از حافظه (Cache)
+	pt.mu.RLock()
+	isGame, exists := pt.ports[srcPort]
+	pt.mu.RUnlock()
+	if exists {
+		return isGame
 	}
 
-	// Important Cache fix: If port isn't registered in the OS table yet (Race condition),
-	// pass it to normal internet but DON'T cache it as 'false' forever.
+	// 2. مسیر سریع (Heuristic): آیا بسته به سمت سرورهای Valve می‌رود؟
+	// پورت‌های SDR معمولاً بین 26900 تا 27300 هستند (علاوه بر 4380 و 3478)
+	// با این ترفند، پینگ‌ها بدون هیچ معطلی و در صفر ثانیه تونل می‌شوند!
+	if (dstPort >= 26900 && dstPort <= 27300) || dstPort == 4380 || dstPort == 3478 {
+		return true
+	}
+
+	// 3. در صورتی که پورت ناشناس بود (مثلاً سرور کامیونیتی با پورت عجیب):
+	// از ویندوز استعلام می‌گیریم
+	pt.refresh()
+	
+	pt.mu.RLock()
+	isGame, exists = pt.ports[srcPort]
+	pt.mu.RUnlock()
+	if exists {
+		return isGame
+	}
+
+	// 4. آخرین تلاش: گاهی ویندوز 10 الی 15 میلی‌ثانیه تاخیر دارد
+	time.Sleep(15 * time.Millisecond)
+	pt.refresh()
+	
+	pt.mu.RLock()
+	isGame, exists = pt.ports[srcPort]
+	pt.mu.RUnlock()
+	if exists {
+		return isGame
+	}
+
 	return false
 }
 
