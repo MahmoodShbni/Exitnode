@@ -68,18 +68,21 @@ var (
 	templates  = map[uint16]*flowTemplate{}
 )
 
-// ---------------------------------------------------------
-// Process Tracker (On-Demand System)
-// ---------------------------------------------------------
 type PortTracker struct {
 	mu       sync.RWMutex
-	ports    map[uint16]bool // true if belongs to game, false if not
+	ports    map[uint16]bool
 	gamePIDs map[uint32]bool
 }
 
 var pt = &PortTracker{
 	ports:    make(map[uint16]bool),
 	gamePIDs: make(map[uint32]bool),
+}
+
+// Struct for our high-speed packet queue
+type packetJob struct {
+	raw  []byte
+	addr divert.Address
 }
 
 func main() {
@@ -125,75 +128,96 @@ func main() {
 
 	dedup := proto.NewDedup(*dedupSize)
 	go replyLoop(h, relayConn, dedup)
+	
+	// Start high-performance capture loop
 	captureLoop(h, relayConn)
 }
 
 func captureLoop(h *divert.Handle, relayConn *net.UDPConn) {
+	// Create a buffered channel (queue) to prevent dropping packets
+	jobs := make(chan packetJob, 4096)
+	
+	// Spawn 16 concurrent workers to process packets asynchronously
+	for i := 0; i < 16; i++ {
+		go outboundWorker(h, relayConn, jobs)
+	}
+
 	buf := make([]byte, 65535)
 	var addr divert.Address
+	
+	// WinDivert loop (Zero blocking)
 	for {
 		n, err := h.Recv(buf, &addr)
 		if err != nil {
 			continue
 		}
-		raw := buf[:n]
 		
-		// محافظت در برابر بسته‌های خراب یا IPv6
-		if len(raw) < 20 || raw[0]>>4 != 4 {
-			_, _ = h.Send(raw, &addr)
+		// Very fast check before memory allocation
+		if n < 20 || buf[0]>>4 != 4 {
+			_, _ = h.Send(buf[:n], &addr)
 			continue
 		}
-		ihl := int(raw[0]&0x0f) * 4
-		if len(raw) < ihl+8 {
-			_, _ = h.Send(raw, &addr)
+		ihl := int(buf[0]&0x0f) * 4
+		if n < ihl+8 {
+			_, _ = h.Send(buf[:n], &addr)
 			continue
 		}
-		
-		srcIP := net.IPv4(raw[12], raw[13], raw[14], raw[15])
-		dstIP := net.IPv4(raw[16], raw[17], raw[18], raw[19])
-		srcPort := binary.BigEndian.Uint16(raw[ihl : ihl+2])
-		dstPort := binary.BigEndian.Uint16(raw[ihl+2 : ihl+4])
-		payload := raw[ihl+8:]
 
-		// --- On-Demand Port Checking ---
-		if *exeName != "" {
-			if !isGamePort(srcPort) {
-				// اگر پورت برای بازی ما نبود، بدون تغییر رها می‌شود تا به اینترنت برود
-				_, _ = h.Send(raw, &addr)
-				continue
-			}
-		}
+		// Copy data and send to queue instantly
+		rawCopy := make([]byte, n)
+		copy(rawCopy, buf[:n])
+		jobs <- packetJob{raw: rawCopy, addr: addr}
+	}
+}
 
-		net4 := addr.Network()
-		tmplMu.Lock()
-		templates[srcPort] = &flowTemplate{
-			localIP:   srcIP,
-			localPort: srcPort,
-			ifIdx:     net4.InterfaceIndex,
-			subIfIdx:  net4.SubInterfaceIndex,
-		}
-		tmplMu.Unlock()
+func outboundWorker(h *divert.Handle, relayConn *net.UDPConn, jobs <-chan packetJob) {
+	for job := range jobs {
+		processOutbound(h, relayConn, job.raw, job.addr)
+	}
+}
 
-		seq := atomic.AddUint32(&seqCounter, 1)
-		enc := proto.Encode(&proto.Packet{
-			Flags:     proto.FlagData,
-			Seq:       seq,
-			Addr:      dstIP,
-			Port:      dstPort,
-			LocalPort: srcPort,
-			Payload:   payload,
-		})
-		
-		for i := 0; i < *redundancy; i++ {
-			if _, err := relayConn.Write(enc); err != nil {
-				break
-			}
+func processOutbound(h *divert.Handle, relayConn *net.UDPConn, raw []byte, addr divert.Address) {
+	ihl := int(raw[0]&0x0f) * 4
+	srcIP := net.IPv4(raw[12], raw[13], raw[14], raw[15])
+	dstIP := net.IPv4(raw[16], raw[17], raw[18], raw[19])
+	srcPort := binary.BigEndian.Uint16(raw[ihl : ihl+2])
+	dstPort := binary.BigEndian.Uint16(raw[ihl+2 : ihl+4])
+	payload := raw[ihl+8:]
+
+	if *exeName != "" {
+		if !isGamePort(srcPort) {
+			_, _ = h.Send(raw, &addr)
+			return
 		}
+	}
+
+	net4 := addr.Network()
+	tmplMu.Lock()
+	templates[srcPort] = &flowTemplate{
+		localIP:   srcIP,
+		localPort: srcPort,
+		ifIdx:     net4.InterfaceIndex,
+		subIfIdx:  net4.SubInterfaceIndex,
+	}
+	tmplMu.Unlock()
+
+	seq := atomic.AddUint32(&seqCounter, 1)
+	enc := proto.Encode(&proto.Packet{
+		Flags:     proto.FlagData,
+		Seq:       seq,
+		Addr:      dstIP,
+		Port:      dstPort,
+		LocalPort: srcPort,
+		Payload:   payload,
+	})
+	
+	for i := 0; i < *redundancy; i++ {
+		_, _ = relayConn.Write(enc)
 	}
 }
 
 // ---------------------------------------------------------
-// Process-Aware Logic (Synchronous & Robust)
+// Process-Aware Logic (Thread-safe & Robust)
 // ---------------------------------------------------------
 
 func syncPIDs(processName string) {
@@ -201,7 +225,6 @@ func syncPIDs(processName string) {
 		pids := getPIDsByProcessName(processName)
 		pt.mu.Lock()
 		pt.gamePIDs = pids
-		// اگر بازی بسته شد، حافظه موقت پورت‌ها را خالی می‌کنیم
 		if len(pids) == 0 {
 			pt.ports = make(map[uint16]bool)
 		}
@@ -215,32 +238,33 @@ func isGamePort(port uint16) bool {
 	isGame, exists := pt.ports[port]
 	pt.mu.RUnlock()
 
-	// اگر از قبل می‌دانیم این پورت مال چه برنامه‌ای است، سریع جواب بده
 	if exists {
 		return isGame
 	}
 
-	// پورت جدید است! عملیات سیستم را برای 1 میلی‌ثانیه متوقف کن تا صاحب پورت پیدا شود
 	pt.mu.Lock()
 	defer pt.mu.Unlock()
 
-	// دابل‌چک (در صورت همزمانیِ نخ‌ها)
 	if isGame, exists = pt.ports[port]; exists {
 		return isGame
 	}
 
 	rows, err := getUDPTable()
 	if err == nil {
-		// نقشه را مجدداً می‌سازیم تا پورت‌های بسته شده پاک شوند (جلوگیری از نشت حافظه)
 		newMap := make(map[uint16]bool)
 		for _, row := range rows {
 			p := parsePort(row.LocalPort)
 			newMap[p] = pt.gamePIDs[row.OwningPid]
 		}
 		pt.ports = newMap
-		return pt.ports[port]
+		
+		if val, ok := pt.ports[port]; ok {
+			return val
+		}
 	}
 
+	// Important Cache fix: If port isn't registered in the OS table yet (Race condition),
+	// pass it to normal internet but DON'T cache it as 'false' forever.
 	return false
 }
 
@@ -271,7 +295,6 @@ func getUDPTable() ([]MIB_UDPROW_OWNER_PID, error) {
 	var buf []byte
 	var ret uintptr
 
-	// به دلیل متغیر بودن طول جدول در ویندوز، درخواست باید به صورت حلقه‌ای انجام شود
 	for i := 0; i < 3; i++ {
 		procGetExtendedUdpTable.Call(0, uintptr(unsafe.Pointer(&size)), 0, AF_INET, UDP_TABLE_OWNER_PID, 0)
 		if size == 0 {
@@ -286,7 +309,7 @@ func getUDPTable() ([]MIB_UDPROW_OWNER_PID, error) {
 			UDP_TABLE_OWNER_PID,
 			0,
 		)
-		if ret == 0 { // NO_ERROR
+		if ret == 0 {
 			break
 		}
 	}
