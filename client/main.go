@@ -107,10 +107,11 @@ func main() {
 		decide = func(uint16) bool { return true }
 		log.Printf("IP mode: relaying UDP to %s via %s (redundancy=%d)", *gameIP, *relayAddr, *redundancy)
 	} else {
-		// Process mode: capture ALL outbound UDP except our own tunnel
-		// traffic to the relay, then relay only the target process's ports.
-		filter = fmt.Sprintf("outbound and udp and not (ip.DstAddr == %s and udp.DstPort == %d)",
-			raddr.IP.String(), raddr.Port)
+		// Process mode: capture ALL outbound UDP, then relay only the
+		// target process's ports. Our own tunnel packets to the relay are
+		// captured too, but decide() returns false for them (they aren't
+		// owned by the target process) so they're passed straight through.
+		filter = "outbound and udp"
 		tracker := newProcTracker(*procName)
 		go tracker.run()
 		decide = tracker.Has
