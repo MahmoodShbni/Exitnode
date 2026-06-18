@@ -19,9 +19,9 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          go-version: "1.23"
           cache: true
-          cache-dependency-path: "**/go.sum"
+          cache-dependency-path: "**/go.mod"
 
       # The project may live at the repo root or inside a subfolder.
       # Find the directory that holds `module relay` and use it everywhere.
@@ -29,16 +29,18 @@ jobs:
         id: mod
         run: |
           d=$(dirname "$(grep -rl '^module relay$' --include=go.mod . | head -1)")
-          if [ -z "$d" ] || [ "$d" = "." ] && [ ! -f go.mod ]; then
+          if [ -z "$d" ] || { [ "$d" = "." ] && [ ! -f go.mod ]; }; then
             echo "could not find go.mod declaring 'module relay'" >&2
             exit 1
           fi
           echo "dir=$d" >> "$GITHUB_OUTPUT"
           echo "module directory: $d"
 
-      - name: Download modules
+      # Resolves github.com/imgk/divert-go (WinDivert 2.x) + golang.org/x/sys
+      # and writes a fresh go.sum.
+      - name: Resolve dependencies
         working-directory: ${{ steps.mod.outputs.dir }}
-        run: go mod download
+        run: go mod tidy
 
       - name: Vet & test
         working-directory: ${{ steps.mod.outputs.dir }}
