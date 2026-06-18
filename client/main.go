@@ -152,20 +152,23 @@ func captureLoop(h *divert.Handle, relayConn *net.UDPConn) {
 			continue
 		}
 		
+		// تبدیل uint به int برای رفع خطای Type-Checking
+		nInt := int(n)
+		
 		// Very fast check before memory allocation
-		if n < 20 || buf[0]>>4 != 4 {
-			_, _ = h.Send(buf[:n], &addr)
+		if nInt < 20 || buf[0]>>4 != 4 {
+			_, _ = h.Send(buf[:nInt], &addr)
 			continue
 		}
 		ihl := int(buf[0]&0x0f) * 4
-		if n < ihl+8 {
-			_, _ = h.Send(buf[:n], &addr)
+		if nInt < ihl+8 {
+			_, _ = h.Send(buf[:nInt], &addr)
 			continue
 		}
 
 		// Copy data and send to queue instantly
-		rawCopy := make([]byte, n)
-		copy(rawCopy, buf[:n])
+		rawCopy := make([]byte, nInt)
+		copy(rawCopy, buf[:nInt])
 		jobs <- packetJob{raw: rawCopy, addr: addr}
 	}
 }
