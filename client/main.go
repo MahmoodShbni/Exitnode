@@ -32,7 +32,6 @@ const (
 	flagTCPChecksum = 1 << 6
 	flagUDPChecksum = 1 << 7
 
-	// Constants for GetExtendedUdpTable
 	AF_INET             = 2
 	UDP_TABLE_OWNER_PID = 1
 )
@@ -56,8 +55,6 @@ var (
 	dedupSize  = flag.Int("dedup", 4096, "duplicate-detection window for replies")
 )
 
-// flowTemplate now only needs to remember local machine bindings.
-// Remote game IP/Port are dynamic!
 type flowTemplate struct {
 	localIP   net.IP
 	localPort uint16
@@ -69,9 +66,21 @@ var (
 	seqCounter uint32
 	tmplMu     sync.RWMutex
 	templates  = map[uint16]*flowTemplate{}
-
-	gamePorts atomic.Pointer[map[uint16]bool]
 )
+
+// ---------------------------------------------------------
+// Process Tracker (On-Demand System)
+// ---------------------------------------------------------
+type PortTracker struct {
+	mu       sync.RWMutex
+	ports    map[uint16]bool // true if belongs to game, false if not
+	gamePIDs map[uint32]bool
+}
+
+var pt = &PortTracker{
+	ports:    make(map[uint16]bool),
+	gamePIDs: make(map[uint32]bool),
+}
 
 func main() {
 	flag.Parse()
@@ -79,7 +88,6 @@ func main() {
 		log.Fatal("error: -relay address is required")
 	}
 
-	// Mutual Exclusivity: Only ONE mode should be active
 	if (*gameIP == "" && *exeName == "") || (*gameIP != "" && *exeName != "") {
 		log.Fatal("usage error: strictly provide EITHER -game <ip> OR -exe <process.exe>")
 	}
@@ -97,20 +105,16 @@ func main() {
 
 	var filter string
 	if *gameIP != "" {
-		// --- Mode 1: Static IP Binding ---
 		gIP := net.ParseIP(*gameIP).To4()
 		if gIP == nil {
 			log.Fatal("invalid -game IP (IPv4 only)")
 		}
 		filter = fmt.Sprintf("outbound and udp and ip.DstAddr == %s", *gameIP)
-		log.Printf("[Mode: IP] relalying traffic bound ONLY to %s via %s (redundancy=%d)", *gameIP, *relayAddr, *redundancy)
+		log.Printf("[Mode: IP] relalying traffic bound ONLY to %s via %s", *gameIP, *relayAddr)
 	} else {
-		// --- Mode 2: Process-Aware Binding ---
 		filter = "outbound and udp"
-		empty := make(map[uint16]bool)
-		gamePorts.Store(&empty)
-		go syncGamePorts(*exeName)
-		log.Printf("[Mode: Process] relaying ALL udp traffic for '%s' via %s (redundancy=%d)", *exeName, *relayAddr, *redundancy)
+		go syncPIDs(*exeName)
+		log.Printf("[Mode: Process] relaying ALL udp traffic for '%s' via %s", *exeName, *relayAddr)
 	}
 
 	h, err := divert.Open(filter, divert.LayerNetwork, divert.PriorityDefault, divert.FlagDefault)
@@ -133,6 +137,12 @@ func captureLoop(h *divert.Handle, relayConn *net.UDPConn) {
 			continue
 		}
 		raw := buf[:n]
+		
+		// محافظت در برابر بسته‌های خراب یا IPv6
+		if len(raw) < 20 || raw[0]>>4 != 4 {
+			_, _ = h.Send(raw, &addr)
+			continue
+		}
 		ihl := int(raw[0]&0x0f) * 4
 		if len(raw) < ihl+8 {
 			_, _ = h.Send(raw, &addr)
@@ -140,16 +150,15 @@ func captureLoop(h *divert.Handle, relayConn *net.UDPConn) {
 		}
 		
 		srcIP := net.IPv4(raw[12], raw[13], raw[14], raw[15])
-		dstIP := net.IPv4(raw[16], raw[17], raw[18], raw[19]) // Dynamically extract game server IP!
+		dstIP := net.IPv4(raw[16], raw[17], raw[18], raw[19])
 		srcPort := binary.BigEndian.Uint16(raw[ihl : ihl+2])
 		dstPort := binary.BigEndian.Uint16(raw[ihl+2 : ihl+4])
 		payload := raw[ihl+8:]
 
-		// If running in Process Mode, check if the packet belongs to our process
+		// --- On-Demand Port Checking ---
 		if *exeName != "" {
-			pm := gamePorts.Load()
-			if pm != nil && !(*pm)[srcPort] {
-				// Not our game process. Re-inject intact to standard internet.
+			if !isGamePort(srcPort) {
+				// اگر پورت برای بازی ما نبود، بدون تغییر رها می‌شود تا به اینترنت برود
 				_, _ = h.Send(raw, &addr)
 				continue
 			}
@@ -169,7 +178,7 @@ func captureLoop(h *divert.Handle, relayConn *net.UDPConn) {
 		enc := proto.Encode(&proto.Packet{
 			Flags:     proto.FlagData,
 			Seq:       seq,
-			Addr:      dstIP,   // Encapsulate dynamic destination
+			Addr:      dstIP,
 			Port:      dstPort,
 			LocalPort: srcPort,
 			Payload:   payload,
@@ -184,29 +193,55 @@ func captureLoop(h *divert.Handle, relayConn *net.UDPConn) {
 }
 
 // ---------------------------------------------------------
-// Process-Aware Logic (Windows API)
+// Process-Aware Logic (Synchronous & Robust)
 // ---------------------------------------------------------
 
-func syncGamePorts(processName string) {
+func syncPIDs(processName string) {
 	for {
 		pids := getPIDsByProcessName(processName)
-		newPorts := make(map[uint16]bool)
-
-		if len(pids) > 0 {
-			rows, err := getUDPTable()
-			if err == nil {
-				for _, row := range rows {
-					if pids[row.OwningPid] {
-						port := parsePort(row.LocalPort)
-						newPorts[port] = true
-					}
-				}
-			}
+		pt.mu.Lock()
+		pt.gamePIDs = pids
+		// اگر بازی بسته شد، حافظه موقت پورت‌ها را خالی می‌کنیم
+		if len(pids) == 0 {
+			pt.ports = make(map[uint16]bool)
 		}
-
-		gamePorts.Store(&newPorts)
+		pt.mu.Unlock()
 		time.Sleep(2 * time.Second)
 	}
+}
+
+func isGamePort(port uint16) bool {
+	pt.mu.RLock()
+	isGame, exists := pt.ports[port]
+	pt.mu.RUnlock()
+
+	// اگر از قبل می‌دانیم این پورت مال چه برنامه‌ای است، سریع جواب بده
+	if exists {
+		return isGame
+	}
+
+	// پورت جدید است! عملیات سیستم را برای 1 میلی‌ثانیه متوقف کن تا صاحب پورت پیدا شود
+	pt.mu.Lock()
+	defer pt.mu.Unlock()
+
+	// دابل‌چک (در صورت همزمانیِ نخ‌ها)
+	if isGame, exists = pt.ports[port]; exists {
+		return isGame
+	}
+
+	rows, err := getUDPTable()
+	if err == nil {
+		// نقشه را مجدداً می‌سازیم تا پورت‌های بسته شده پاک شوند (جلوگیری از نشت حافظه)
+		newMap := make(map[uint16]bool)
+		for _, row := range rows {
+			p := parsePort(row.LocalPort)
+			newMap[p] = pt.gamePIDs[row.OwningPid]
+		}
+		pt.ports = newMap
+		return pt.ports[port]
+	}
+
+	return false
 }
 
 func getPIDsByProcessName(name string) map[uint32]bool {
@@ -233,28 +268,28 @@ func getPIDsByProcessName(name string) map[uint32]bool {
 
 func getUDPTable() ([]MIB_UDPROW_OWNER_PID, error) {
 	var size uint32
-	procGetExtendedUdpTable.Call(
-		0,
-		uintptr(unsafe.Pointer(&size)),
-		0,
-		AF_INET,
-		UDP_TABLE_OWNER_PID,
-		0,
-	)
+	var buf []byte
+	var ret uintptr
 
-	if size == 0 {
-		return nil, nil
+	// به دلیل متغیر بودن طول جدول در ویندوز، درخواست باید به صورت حلقه‌ای انجام شود
+	for i := 0; i < 3; i++ {
+		procGetExtendedUdpTable.Call(0, uintptr(unsafe.Pointer(&size)), 0, AF_INET, UDP_TABLE_OWNER_PID, 0)
+		if size == 0 {
+			return nil, nil
+		}
+		buf = make([]byte, size)
+		ret, _, _ = procGetExtendedUdpTable.Call(
+			uintptr(unsafe.Pointer(&buf[0])),
+			uintptr(unsafe.Pointer(&size)),
+			0,
+			AF_INET,
+			UDP_TABLE_OWNER_PID,
+			0,
+		)
+		if ret == 0 { // NO_ERROR
+			break
+		}
 	}
-
-	buf := make([]byte, size)
-	ret, _, _ := procGetExtendedUdpTable.Call(
-		uintptr(unsafe.Pointer(&buf[0])),
-		uintptr(unsafe.Pointer(&size)),
-		0,
-		AF_INET,
-		UDP_TABLE_OWNER_PID,
-		0,
-	)
 
 	if ret != 0 {
 		return nil, fmt.Errorf("error: %d", ret)
@@ -289,7 +324,7 @@ func parsePort(dwPort uint32) uint16 {
 }
 
 // ---------------------------------------------------------
-// Original Inbound Injection Logic
+// Inbound Injection Logic
 // ---------------------------------------------------------
 
 func replyLoop(h *divert.Handle, relayConn *net.UDPConn, dedup *proto.Dedup) {
@@ -314,7 +349,6 @@ func replyLoop(h *divert.Handle, relayConn *net.UDPConn, dedup *proto.Dedup) {
 			continue
 		}
 
-		// Inject dynamic pkt.Addr and pkt.Port from the relay response!
 		raw := buildInbound(tmpl, pkt.Addr, pkt.Port, pkt.Payload)
 
 		var a divert.Address
