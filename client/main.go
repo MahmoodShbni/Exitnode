@@ -6,16 +6,19 @@
 // from the server. TCP and every other process keep their normal path.
 //
 // Two mutually exclusive selection modes (pick exactly one):
-//   -game <IP>      capture UDP destined to this game-server IP
-//   -proc <name>    capture UDP owned by this process, e.g. cs2.exe
+//
+//	-game <IP>      capture UDP destined to this game-server IP
+//	-proc <name>    capture UDP owned by this process, e.g. cs2.exe
 //
 // Requirements next to the .exe (from the official WinDivert 2.2 release):
 //   - WinDivert.dll
 //   - WinDivert64.sys
+//
 // Run as Administrator.
 //
 // Build:
-//   GOOS=windows GOARCH=amd64 go build -o relay-client.exe ./client
+//
+//	GOOS=windows GOARCH=amd64 go build -o relay-client.exe ./client
 package main
 
 import (
@@ -48,9 +51,31 @@ var (
 	relayAddr  = flag.String("relay", "", "relay server address host:port (required)")
 	gameIP     = flag.String("game", "", "IP mode: game server IP to capture, e.g. 1.2.3.4")
 	procName   = flag.String("proc", "", "process mode: executable name to capture, e.g. cs2.exe")
+	protocol   = flag.String("protocol", "udp", "client<->relay transport: udp | faketcp")
 	redundancy = flag.Int("redundancy", 2, "send each game packet this many times to the relay")
 	dedupSize  = flag.Int("dedup", 4096, "duplicate-detection window for replies")
 )
+
+// lastIface holds the most recent default outbound interface indices learned
+// from the game-capture handle, packed as (ifIdx<<32 | subIfIdx) plus a valid
+// bit. fake-TCP needs these to inject its outbound packets.
+var lastIface struct {
+	val   atomic.Uint64
+	valid atomic.Bool
+}
+
+func storeIface(ifIdx, subIfIdx uint32) {
+	lastIface.val.Store(uint64(ifIdx)<<32 | uint64(subIfIdx))
+	lastIface.valid.Store(true)
+}
+
+func currentIface() (ifIdx, subIfIdx uint32, ok bool) {
+	if !lastIface.valid.Load() {
+		return 0, 0, false
+	}
+	v := lastIface.val.Load()
+	return uint32(v >> 32), uint32(v), true
+}
 
 // flowTemplate remembers the addressing of an outbound packet so we can
 // reconstruct the matching inbound packet for re-injection.
@@ -86,12 +111,21 @@ func main() {
 	if err != nil {
 		log.Fatalf("resolve relay: %v", err)
 	}
-	relayConn, err := net.DialUDP("udp", nil, raddr)
-	if err != nil {
-		log.Fatalf("dial relay: %v", err)
+
+	// Pick the client<->relay transport.
+	var transport relayTransport
+	switch *protocol {
+	case "udp":
+		transport, err = newUDPTransport(raddr)
+	case "faketcp":
+		transport, err = newFaketcpClient(raddr.IP.To4(), uint16(raddr.Port), currentIface)
+	default:
+		log.Fatalf("invalid -protocol %q (use udp or faketcp)", *protocol)
 	}
-	_ = relayConn.SetReadBuffer(4 << 20)
-	_ = relayConn.SetWriteBuffer(4 << 20)
+	if err != nil {
+		log.Fatalf("open %s transport: %v", *protocol, err)
+	}
+	defer transport.Close()
 
 	// Build the capture filter and the per-packet relay decision.
 	var filter string
@@ -105,7 +139,7 @@ func main() {
 		// Filter already restricts to the game IP, so always relay.
 		filter = fmt.Sprintf("outbound and udp and ip.DstAddr == %s", *gameIP)
 		decide = func(uint16) bool { return true }
-		log.Printf("IP mode: relaying UDP to %s via %s (redundancy=%d)", *gameIP, *relayAddr, *redundancy)
+		log.Printf("IP mode: relaying UDP to %s via %s (%s, redundancy=%d)", *gameIP, *relayAddr, *protocol, *redundancy)
 	} else {
 		// Process mode: capture ALL outbound UDP, then relay only the
 		// target process's ports. Our own tunnel packets to the relay are
@@ -115,7 +149,7 @@ func main() {
 		tracker := newProcTracker(*procName)
 		go tracker.run()
 		decide = tracker.Has
-		log.Printf("process mode: relaying UDP of %q via %s (redundancy=%d)", *procName, *relayAddr, *redundancy)
+		log.Printf("process mode: relaying UDP of %q via %s (%s, redundancy=%d)", *procName, *relayAddr, *protocol, *redundancy)
 	}
 
 	h, err := divert.Open(filter, divert.LayerNetwork, divert.PriorityDefault, divert.FlagDefault)
@@ -125,13 +159,13 @@ func main() {
 	defer h.Close()
 
 	dedup := proto.NewDedup(*dedupSize)
-	go replyLoop(h, relayConn, dedup)
-	captureLoop(h, relayConn, decide)
+	go replyLoop(h, transport, dedup)
+	captureLoop(h, transport, decide)
 }
 
 // captureLoop reads outbound UDP. Packets the decider accepts are tunneled
 // to the relay; everything else is re-injected unchanged (pass-through).
-func captureLoop(h *divert.Handle, relayConn *net.UDPConn, decide func(uint16) bool) {
+func captureLoop(h *divert.Handle, transport relayTransport, decide func(uint16) bool) {
 	buf := make([]byte, 65535)
 	var addr divert.Address
 	for {
@@ -148,6 +182,10 @@ func captureLoop(h *divert.Handle, relayConn *net.UDPConn, decide func(uint16) b
 		}
 		srcPort := binary.BigEndian.Uint16(raw[ihl : ihl+2])
 
+		// Record the default outbound interface for fake-TCP injection.
+		ne := addr.Network()
+		storeIface(ne.InterfaceIndex, ne.SubInterfaceIndex)
+
 		if !decide(srcPort) {
 			// Not our target traffic: send it back out untouched.
 			if _, err := h.Send(raw, &addr); err != nil {
@@ -161,7 +199,6 @@ func captureLoop(h *divert.Handle, relayConn *net.UDPConn, decide func(uint16) b
 		dstPort := binary.BigEndian.Uint16(raw[ihl+2 : ihl+4])
 		payload := raw[ihl+8:]
 
-		ne := addr.Network()
 		tmplMu.Lock()
 		templates[srcPort] = &flowTemplate{
 			localIP:   srcIP,
@@ -183,7 +220,7 @@ func captureLoop(h *divert.Handle, relayConn *net.UDPConn, decide func(uint16) b
 			Payload:   payload,
 		})
 		for i := 0; i < *redundancy; i++ {
-			if _, err := relayConn.Write(enc); err != nil {
+			if err := transport.Send(enc); err != nil {
 				log.Printf("to relay: %v", err)
 				break
 			}
@@ -193,10 +230,10 @@ func captureLoop(h *divert.Handle, relayConn *net.UDPConn, decide func(uint16) b
 }
 
 // replyLoop reads encapsulated replies and injects them as inbound.
-func replyLoop(h *divert.Handle, relayConn *net.UDPConn, dedup *proto.Dedup) {
+func replyLoop(h *divert.Handle, transport relayTransport, dedup *proto.Dedup) {
 	buf := make([]byte, 65535)
 	for {
-		n, err := relayConn.Read(buf)
+		n, err := transport.Recv(buf)
 		if err != nil {
 			log.Printf("from relay: %v", err)
 			continue
@@ -247,8 +284,8 @@ func buildInbound(t *flowTemplate, payload []byte) []byte {
 	binary.BigEndian.PutUint16(b[2:4], uint16(total))
 	binary.BigEndian.PutUint16(b[4:6], 0)
 	binary.BigEndian.PutUint16(b[6:8], 0)
-	b[8] = 64 // TTL
-	b[9] = 17 // UDP
+	b[8] = 64                       // TTL
+	b[9] = 17                       // UDP
 	copy(b[12:16], t.gameIP.To4())  // src = game server
 	copy(b[16:20], t.localIP.To4()) // dst = local
 	binary.BigEndian.PutUint16(b[10:12], ipChecksum(b[:ihl]))

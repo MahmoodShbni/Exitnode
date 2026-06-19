@@ -69,6 +69,32 @@ relay-client.exe -relay <VPS_IP>:51820 -proc cs2.exe -redundancy 2
 با seq دور می‌اندازد. این همان مکانیزمی است که packet loss را روی لگ بین‌المللی
 (کلاینت→VPS) می‌پوشاند. مصرف پهنای باند هم به همان نسبت بالا می‌رود.
 
+## ترنسپورت: UDP یا fake-TCP
+
+با `-protocol` لگِ کلاینت↔رله را انتخاب می‌کنی. **هر دو طرف باید یکی باشند.**
+
+- `udp` (پیش‌فرض): مسیر پایدار و تست‌شده.
+- `faketcp`: برای شبکه‌هایی که UDP را کامل بسته‌اند ولی TCP باز است. پکت‌های خام با
+  هدر TCP می‌فرستیم که از دید فایروال TCP دیده می‌شوند، ولی رفتارشان datagram است
+  (نه retransmission، نه ordering، نه head-of-line blocking) — پس تأثیرش روی پینگ
+  تقریباً مثل UDP است.
+
+```
+# سرور (root لازم است):
+sudo ./relay-server -listen :51820 -protocol faketcp
+# و حتماً RST کرنل را روی همان پورت ببند، وگرنه اتصال جعلی بسته می‌شود:
+sudo iptables -A OUTPUT -p tcp --sport 51820 --tcp-flags RST RST -j DROP
+
+# کلاینت (Administrator):
+relay-client.exe -relay <VPS_IP>:51820 -proc cs2.exe -protocol faketcp -redundancy 2
+```
+
+نکات faketcp: سمت سرور raw socket می‌سازد و به دسترسی root (یا `CAP_NET_RAW`) نیاز دارد؛
+سمت کلاینت پکت‌های inbound از رله را با WinDivert می‌گیرد و مصرف می‌کند تا کرنل ویندوز
+RST نزند. این حالت **آزمایشی** است و هنوز روی سخت‌افزار واقعی تست نشده؛ در برابر فیلترهای
+ساده‌ی «UDP بسته» کار می‌کند، ولی DPI خیلی باهوش که seq/ack را سخت‌گیرانه دنبال می‌کند
+ممکن است نیاز به تنظیم بیشتر داشته باشد. اگر UDP باز است، همان `-protocol udp` را نگه دار.
+
 ## قبل از هر چیز: اندازه‌گیری کن
 
 با `WinMTR` مسیر فعلی‌ات به IP سرور CS2 را ببین، و دوباره با مسیر از طریق VPS.

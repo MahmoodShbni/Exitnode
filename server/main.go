@@ -2,11 +2,12 @@
 //
 // Flow:
 //
-//	client --(encapsulated UDP)--> relay --(raw UDP)--> CS2 server
-//	client <--(encapsulated UDP)-- relay <--(raw UDP)-- CS2 server
+//	client --(encapsulated)--> relay --(raw UDP)--> game server
+//	client <--(encapsulated)-- relay <--(raw UDP)-- game server
 //
-// It is intentionally stateless beyond a short-lived per-flow session
-// so it can sit close to the game datacenter and just shuttle packets.
+// The client<->relay leg can be plain UDP (default) or fake-TCP
+// (-protocol faketcp) for networks that block UDP. The relay<->game leg is
+// always real UDP.
 package main
 
 import (
@@ -21,7 +22,8 @@ import (
 )
 
 var (
-	listenAddr  = flag.String("listen", ":51820", "UDP address to listen on for client traffic")
+	listenAddr  = flag.String("listen", ":51820", "address to listen on for client traffic")
+	protocol    = flag.String("protocol", "udp", "client<->relay transport: udp | faketcp")
 	idleTimeout = flag.Duration("idle", 60*time.Second, "drop a flow after this much silence")
 	redundancy  = flag.Int("redundancy", 1, "send each reply this many times back to the client")
 	dedupSize   = flag.Int("dedup", 4096, "duplicate-detection window per flow")
@@ -29,60 +31,66 @@ var (
 
 // session represents one game flow: a unique (client, dst, localPort) triple.
 type session struct {
-	conn       *net.UDPConn // connected socket to the real game server
-	clientAddr *net.UDPAddr // where to send replies (the client's relay socket)
-	dst        *net.UDPAddr // the game server
-	localPort  uint16       // client's original source port (flow id)
-	seqOut     uint32       // sequence counter for replies (for client-side dedup)
-	dedupIn    *proto.Dedup // drops duplicate copies coming from the client
-	lastSeen   atomic.Int64 // unixnano of last client packet
+	conn      *net.UDPConn // connected socket to the real game server
+	client    string       // transport token for replies
+	dst       *net.UDPAddr // the game server
+	localPort uint16       // client's original source port (flow id)
+	seqOut    uint32       // sequence counter for replies (for client dedup)
+	dedupIn   *proto.Dedup // drops duplicate copies coming from the client
+	lastSeen  atomic.Int64 // unixnano of last client packet
 }
 
 type server struct {
-	listen   *net.UDPConn
-	mu       sync.Mutex
-	sessions map[string]*session
+	transport serverTransport
+	mu        sync.Mutex
+	sessions  map[string]*session
 }
 
 func main() {
 	flag.Parse()
 
-	laddr, err := net.ResolveUDPAddr("udp", *listenAddr)
-	if err != nil {
-		log.Fatalf("resolve listen: %v", err)
+	var transport serverTransport
+	var err error
+	switch *protocol {
+	case "udp":
+		transport, err = newUDPTransport(*listenAddr)
+	case "faketcp":
+		port, perr := portOf(*listenAddr)
+		if perr != nil {
+			log.Fatalf("faketcp needs a numeric port in -listen: %v", perr)
+		}
+		transport, err = newFaketcpServer(port)
+	default:
+		log.Fatalf("invalid -protocol %q (use udp or faketcp)", *protocol)
 	}
-	lc, err := net.ListenUDP("udp", laddr)
 	if err != nil {
-		log.Fatalf("listen: %v", err)
+		log.Fatalf("open %s transport: %v", *protocol, err)
 	}
-	// Generous buffers help under bursty load.
-	_ = lc.SetReadBuffer(4 << 20)
-	_ = lc.SetWriteBuffer(4 << 20)
+	defer transport.Close()
 
-	s := &server{listen: lc, sessions: make(map[string]*session)}
+	s := &server{transport: transport, sessions: make(map[string]*session)}
 	go s.janitor()
 
-	log.Printf("relay listening on %s", *listenAddr)
+	log.Printf("relay listening on %s (%s)", *listenAddr, *protocol)
 	s.loop()
 }
 
 func (s *server) loop() {
-	buf := make([]byte, 65535)
 	for {
-		n, clientAddr, err := s.listen.ReadFromUDP(buf)
+		frame, client, err := s.transport.Recv()
 		if err != nil {
-			log.Printf("read: %v", err)
+			log.Printf("recv: %v", err)
 			continue
 		}
-		pkt, err := proto.Decode(buf[:n])
+		pkt, err := proto.Decode(frame)
 		if err != nil {
 			continue // not ours / garbage
 		}
 
 		dst := &net.UDPAddr{IP: pkt.Addr, Port: int(pkt.Port)}
-		key := clientAddr.String() + "|" + dst.String() + "|" + itoa(pkt.LocalPort)
+		key := client + "|" + dst.String() + "|" + itoa(pkt.LocalPort)
 
-		sess := s.getOrCreate(key, clientAddr, dst, pkt.LocalPort)
+		sess := s.getOrCreate(key, client, dst, pkt.LocalPort)
 		if sess == nil {
 			continue
 		}
@@ -93,18 +101,16 @@ func (s *server) loop() {
 			continue
 		}
 
-		// Forward the original game payload to the real server.
 		if _, err := sess.conn.Write(pkt.Payload); err != nil {
 			log.Printf("forward to %s: %v", dst, err)
 		}
 	}
 }
 
-func (s *server) getOrCreate(key string, clientAddr, dst *net.UDPAddr, localPort uint16) *session {
+func (s *server) getOrCreate(key, client string, dst *net.UDPAddr, localPort uint16) *session {
 	s.mu.Lock()
 	if sess, ok := s.sessions[key]; ok {
-		// Client source port may change on NAT rebind; keep it fresh.
-		sess.clientAddr = clientAddr
+		sess.client = client // keep reply route fresh
 		s.mu.Unlock()
 		return sess
 	}
@@ -117,11 +123,11 @@ func (s *server) getOrCreate(key string, clientAddr, dst *net.UDPAddr, localPort
 	}
 
 	sess := &session{
-		conn:       conn,
-		clientAddr: clientAddr,
-		dst:        dst,
-		localPort:  localPort,
-		dedupIn:    proto.NewDedup(*dedupSize),
+		conn:      conn,
+		client:    client,
+		dst:       dst,
+		localPort: localPort,
+		dedupIn:   proto.NewDedup(*dedupSize),
 	}
 	sess.lastSeen.Store(time.Now().UnixNano())
 
@@ -130,7 +136,7 @@ func (s *server) getOrCreate(key string, clientAddr, dst *net.UDPAddr, localPort
 	s.mu.Unlock()
 
 	go s.readReplies(key, sess)
-	log.Printf("new flow %s -> %s (localPort %d)", clientAddr, dst, localPort)
+	log.Printf("new flow %s -> %s (localPort %d)", client, dst, localPort)
 	return sess
 }
 
@@ -164,8 +170,8 @@ func (s *server) readReplies(key string, sess *session) {
 
 		// Send R copies back; the client dedups by seq.
 		for i := 0; i < *redundancy; i++ {
-			if _, err := s.listen.WriteToUDP(out, sess.clientAddr); err != nil {
-				log.Printf("reply to %s: %v", sess.clientAddr, err)
+			if err := s.transport.Send(out, sess.client); err != nil {
+				log.Printf("reply to %s: %v", sess.client, err)
 				break
 			}
 		}
@@ -201,4 +207,17 @@ func itoa(v uint16) string {
 		v /= 10
 	}
 	return string(b[i:])
+}
+
+// portOf extracts the numeric port from a "host:port" or ":port" string.
+func portOf(addr string) (uint16, error) {
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0, err
+	}
+	p, err := net.LookupPort("udp", portStr)
+	if err != nil {
+		return 0, err
+	}
+	return uint16(p), nil
 }
