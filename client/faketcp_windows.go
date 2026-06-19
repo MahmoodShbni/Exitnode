@@ -148,8 +148,17 @@ func (t *faketcpClient) readLoop() {
 			// Ignore; firewall/relay reset. handshakeLoop keeps trying.
 			continue
 		case seg.Flags&tcpip.FlagSYN != 0 && seg.Flags&tcpip.FlagACK != 0:
-			// SYN-ACK: lock in sequence numbers and ACK it.
+			// SYN-ACK. If we're already established, a duplicate SYN-ACK
+			// must NOT rewind our sequence numbers (that would corrupt a
+			// live session). Just re-ACK so the relay stops resending.
 			t.mu.Lock()
+			if t.established {
+				seq := t.ourSeq
+				ack := t.theirSeq
+				t.mu.Unlock()
+				_ = t.inject(seq, ack, tcpip.FlagACK, nil)
+				continue
+			}
 			t.theirSeq = seg.Seq + 1
 			t.ourSeq = t.synSeq + 1
 			ack := t.theirSeq
@@ -163,7 +172,11 @@ func (t *faketcpClient) readLoop() {
 				if !t.established {
 					t.ourSeq = t.synSeq + 1
 				}
-				t.theirSeq = seg.Seq + uint32(len(seg.Payload))
+				// Advance our ack only on forward progress (tolerate reorder).
+				next := seg.Seq + uint32(len(seg.Payload))
+				if tcpip.SeqGT(next, t.theirSeq) {
+					t.theirSeq = next
+				}
 				ack := t.theirSeq
 				seq := t.ourSeq
 				t.mu.Unlock()

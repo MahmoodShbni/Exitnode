@@ -36,8 +36,10 @@ type faketcpServer struct {
 type ftClient struct {
 	ip       net.IP
 	port     uint16
-	ourSeq   uint32
-	theirSeq uint32
+	synSeq   uint32 // our initial seq (for resending SYN-ACK)
+	ourSeq   uint32 // next data seq
+	theirSeq uint32 // next expected client seq (our ack)
+	synAcked bool   // handshake initialized
 }
 
 func newFaketcpServer(port uint16) (*faketcpServer, error) {
@@ -81,26 +83,41 @@ func (s *faketcpServer) Recv() ([]byte, string, error) {
 		s.mu.Lock()
 		c := s.clients[token]
 		if c == nil {
-			c = &ftClient{ip: seg.SrcIP.To4(), port: seg.SrcPort, ourSeq: rand.Uint32()}
+			c = &ftClient{ip: seg.SrcIP.To4(), port: seg.SrcPort}
 			s.clients[token] = c
 		}
 		s.mu.Unlock()
 
 		switch {
 		case seg.Flags&tcpip.FlagSYN != 0 && seg.Flags&tcpip.FlagACK == 0:
-			// SYN: reply SYN-ACK.
+			// SYN: reply SYN-ACK. Idempotent — a retransmitted SYN must
+			// reuse the same initial seq, never re-increment, or the data
+			// stream's starting seq would drift and the firewall/peer would
+			// drop the flow.
 			s.mu.Lock()
-			c.theirSeq = seg.Seq + 1
-			synAckSeq := c.ourSeq
-			c.ourSeq++ // SYN consumes one
+			if !c.synAcked {
+				c.synSeq = rand.Uint32()
+				c.ourSeq = c.synSeq + 1 // SYN consumes one
+				c.theirSeq = seg.Seq + 1
+				c.synAcked = true
+			} else {
+				// duplicate SYN: never move ack backward
+				if n := seg.Seq + 1; tcpip.SeqGT(n, c.theirSeq) {
+					c.theirSeq = n
+				}
+			}
+			synSeq := c.synSeq
 			ack := c.theirSeq
 			s.mu.Unlock()
-			s.sendRaw(c, synAckSeq, ack, tcpip.FlagSYN|tcpip.FlagACK, nil)
+			s.sendRaw(c, synSeq, ack, tcpip.FlagSYN|tcpip.FlagACK, nil)
 			continue
 		case len(seg.Payload) > 0:
-			// Data: update ack bookkeeping and deliver to the relay.
+			// Data: advance ack on forward progress and deliver to the relay.
 			s.mu.Lock()
-			c.theirSeq = seg.Seq + uint32(len(seg.Payload))
+			next := seg.Seq + uint32(len(seg.Payload))
+			if tcpip.SeqGT(next, c.theirSeq) {
+				c.theirSeq = next
+			}
 			s.mu.Unlock()
 			out := make([]byte, len(seg.Payload))
 			copy(out, seg.Payload)

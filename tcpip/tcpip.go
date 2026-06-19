@@ -47,10 +47,10 @@ func Build(srcIP, dstIP net.IP, srcPort, dstPort uint16, seq, ack uint32, flags 
 	b[0] = 0x45 // version 4, IHL 5
 	b[1] = 0x00
 	binary.BigEndian.PutUint16(b[2:4], uint16(total))
-	binary.BigEndian.PutUint16(b[4:6], 0)      // id
-	binary.BigEndian.PutUint16(b[6:8], 0x4000) // don't fragment
-	b[8] = 64                                  // TTL
-	b[9] = 6                                   // protocol = TCP
+	binary.BigEndian.PutUint16(b[4:6], 0) // id
+	binary.BigEndian.PutUint16(b[6:8], 0) // flags=0 (allow fragmentation), offset 0
+	b[8] = 64                             // TTL
+	b[9] = 6                              // protocol = TCP
 	copy(b[12:16], srcIP.To4())
 	copy(b[16:20], dstIP.To4())
 	binary.BigEndian.PutUint16(b[10:12], checksum(b[:ipHdrLen]))
@@ -102,6 +102,12 @@ func Parse(raw []byte) (Segment, bool) {
 	s.Window = binary.BigEndian.Uint16(t[14:16])
 	s.Payload = t[dataOff:]
 	return s, true
+}
+
+// SeqGT reports whether sequence number a is "after" b, accounting for
+// 32-bit wraparound (RFC 1982 style comparison).
+func SeqGT(a, b uint32) bool {
+	return int32(a-b) > 0
 }
 
 // checksum is the standard one's-complement IP checksum.
