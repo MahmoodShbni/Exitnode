@@ -22,11 +22,14 @@
 package main
 
 import (
+	"bufio"
 	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -50,6 +53,7 @@ const (
 var (
 	relayAddr  = flag.String("relay", "", "relay server address host:port (required)")
 	gameIP     = flag.String("game", "", "IP mode: game server IP to capture, e.g. 1.2.3.4")
+	gameFile   = flag.String("game-file", "", "IP mode: file with one game server IPv4 per line")
 	procName   = flag.String("proc", "", "process mode: executable name to capture, e.g. cs2.exe")
 	protocol   = flag.String("protocol", "udp", "client<->relay transport: udp | faketcp")
 	redundancy = flag.Int("redundancy", 2, "send each game packet this many times to the relay")
@@ -99,12 +103,11 @@ func main() {
 	if *relayAddr == "" {
 		log.Fatal("missing -relay host:port")
 	}
-	// Exactly one of -game / -proc.
-	switch {
-	case *gameIP == "" && *procName == "":
-		log.Fatal("choose a mode: either -game <ip> or -proc <name>")
-	case *gameIP != "" && *procName != "":
-		log.Fatal("-game and -proc are mutually exclusive; pick one")
+	// Exactly one mode: IP (-game and/or -game-file) OR process (-proc).
+	hasGame := *gameIP != "" || *gameFile != ""
+	hasProc := *procName != ""
+	if hasGame == hasProc {
+		log.Fatal("choose exactly one mode: -game <ip> / -game-file <path>, OR -proc <name>")
 	}
 
 	raddr, err := net.ResolveUDPAddr("udp", *relayAddr)
@@ -128,18 +131,38 @@ func main() {
 	defer transport.Close()
 
 	// Build the capture filter and the per-packet relay decision.
+	// decide(srcPort, dstIP) reports whether a captured packet should be
+	// relayed (vs passed straight through).
 	var filter string
-	var decide func(srcPort uint16) bool
+	var decide func(srcPort uint16, dstIP net.IP) bool
 
-	if *gameIP != "" {
-		gIP := net.ParseIP(*gameIP).To4()
-		if gIP == nil {
-			log.Fatal("invalid -game IP (IPv4 only)")
+	if hasGame {
+		set, dotted, err := loadGameIPs(*gameIP, *gameFile)
+		if err != nil {
+			log.Fatalf("game IPs: %v", err)
 		}
-		// Filter already restricts to the game IP, so always relay.
-		filter = fmt.Sprintf("outbound and udp and ip.DstAddr == %s", *gameIP)
-		decide = func(uint16) bool { return true }
-		log.Printf("IP mode: relaying UDP to %s via %s (%s, redundancy=%d)", *gameIP, *relayAddr, *protocol, *redundancy)
+		if len(set) == 0 {
+			log.Fatal("no valid game IPs given")
+		}
+		// Small lists: let the kernel pre-filter with an OR of addresses.
+		// Large lists: capture all outbound UDP and match in user space
+		// (avoids hitting WinDivert's filter-length limits).
+		const orFilterMax = 60
+		if len(dotted) <= orFilterMax {
+			parts := make([]string, len(dotted))
+			for i, ip := range dotted {
+				parts[i] = "ip.DstAddr == " + ip
+			}
+			filter = "outbound and udp and (" + strings.Join(parts, " or ") + ")"
+		} else {
+			filter = "outbound and udp"
+		}
+		decide = func(_ uint16, dstIP net.IP) bool {
+			_, ok := set[ipToU32(dstIP)]
+			return ok
+		}
+		log.Printf("IP mode: relaying UDP to %d server IP(s) via %s (%s, redundancy=%d)",
+			len(set), *relayAddr, *protocol, *redundancy)
 	} else {
 		// Process mode: capture ALL outbound UDP, then relay only the
 		// target process's ports. Our own tunnel packets to the relay are
@@ -148,7 +171,7 @@ func main() {
 		filter = "outbound and udp"
 		tracker := newProcTracker(*procName)
 		go tracker.run()
-		decide = tracker.Has
+		decide = func(srcPort uint16, _ net.IP) bool { return tracker.Has(srcPort) }
 		log.Printf("process mode: relaying UDP of %q via %s (%s, redundancy=%d)", *procName, *relayAddr, *protocol, *redundancy)
 	}
 
@@ -165,7 +188,7 @@ func main() {
 
 // captureLoop reads outbound UDP. Packets the decider accepts are tunneled
 // to the relay; everything else is re-injected unchanged (pass-through).
-func captureLoop(h *divert.Handle, transport relayTransport, decide func(uint16) bool) {
+func captureLoop(h *divert.Handle, transport relayTransport, decide func(uint16, net.IP) bool) {
 	buf := make([]byte, 65535)
 	var addr divert.Address
 	for {
@@ -181,12 +204,13 @@ func captureLoop(h *divert.Handle, transport relayTransport, decide func(uint16)
 			continue
 		}
 		srcPort := binary.BigEndian.Uint16(raw[ihl : ihl+2])
+		dstIP := net.IPv4(raw[16], raw[17], raw[18], raw[19])
 
 		// Record the default outbound interface for fake-TCP injection.
 		ne := addr.Network()
 		storeIface(ne.InterfaceIndex, ne.SubInterfaceIndex)
 
-		if !decide(srcPort) {
+		if !decide(srcPort, dstIP) {
 			// Not our target traffic: send it back out untouched.
 			if _, err := h.Send(raw, &addr); err != nil {
 				log.Printf("passthrough: %v", err)
@@ -195,7 +219,6 @@ func captureLoop(h *divert.Handle, transport relayTransport, decide func(uint16)
 		}
 
 		srcIP := net.IPv4(raw[12], raw[13], raw[14], raw[15])
-		dstIP := net.IPv4(raw[16], raw[17], raw[18], raw[19])
 		dstPort := binary.BigEndian.Uint16(raw[ihl+2 : ihl+4])
 		payload := raw[ihl+8:]
 
@@ -338,4 +361,71 @@ func udpChecksum(srcIP, dstIP net.IP, udp []byte) uint16 {
 		c = 0xffff
 	}
 	return c
+}
+
+// ipToU32 packs an IPv4 address into a uint32 for set membership tests.
+func ipToU32(ip net.IP) uint32 {
+	v4 := ip.To4()
+	if v4 == nil {
+		return 0
+	}
+	return binary.BigEndian.Uint32(v4)
+}
+
+// loadGameIPs builds the set of game-server IPv4s to relay, from an optional
+// single -game IP plus an optional file (one IPv4 per line; blank lines and
+// lines starting with '#' are ignored). It returns the set keyed by uint32
+// and the list of dotted strings (for building a WinDivert filter).
+func loadGameIPs(single, path string) (map[uint32]struct{}, []string, error) {
+	set := make(map[uint32]struct{})
+	var dotted []string
+
+	add := func(s string) error {
+		ip := net.ParseIP(s).To4()
+		if ip == nil {
+			return fmt.Errorf("invalid IPv4: %q", s)
+		}
+		k := ipToU32(ip)
+		if _, ok := set[k]; !ok {
+			set[k] = struct{}{}
+			dotted = append(dotted, ip.String())
+		}
+		return nil
+	}
+
+	if single != "" {
+		if err := add(single); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	if path != "" {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, nil, err
+		}
+		defer f.Close()
+		sc := bufio.NewScanner(f)
+		line := 0
+		for sc.Scan() {
+			line++
+			s := strings.TrimSpace(sc.Text())
+			if s == "" || strings.HasPrefix(s, "#") {
+				continue
+			}
+			// allow "ip # comment" and "ip:port" forms
+			s = strings.TrimSpace(strings.SplitN(s, "#", 2)[0])
+			if h, _, err := net.SplitHostPort(s); err == nil {
+				s = h
+			}
+			if err := add(s); err != nil {
+				return nil, nil, fmt.Errorf("%s line %d: %w", path, line, err)
+			}
+		}
+		if err := sc.Err(); err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return set, dotted, nil
 }

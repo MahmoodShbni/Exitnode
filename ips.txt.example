@@ -1,0 +1,8 @@
+# One game-server IPv4 per line.
+# Blank lines and lines starting with '#' are ignored.
+# Trailing comments and ip:port are accepted, e.g.  1.2.3.4:27015  # frankfurt
+#
+# Example (replace with the real CS2 server IPs you measured):
+5.9.145.87
+91.107.157.205
+# 203.0.113.10   # disabled for now

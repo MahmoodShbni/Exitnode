@@ -55,6 +55,15 @@ GOOS=windows GOARCH=amd64 go build -o relay-client.exe ./client
 relay-client.exe -relay <VPS_IP>:51820 -game <CS2_SERVER_IP> -redundancy 2
 ```
 
+برای چند IP، یک فایل متنی بده (هر خط یک IPv4؛ خطوط خالی و خطوطی که با `#` شروع می‌شوند
+نادیده گرفته می‌شوند؛ `ip:port` و کامنت بعد از IP هم پذیرفته می‌شود):
+```
+relay-client.exe -relay <VPS_IP>:51820 -game-file ips.txt -redundancy 2
+```
+می‌توانی `-game` و `-game-file` را با هم بدهی؛ مجموعه‌شان ادغام می‌شود. تا ۶۰ IP با
+فیلتر کرنل پیش‌فیلتر می‌شوند؛ بیشتر از آن، همه‌ی UDP خروجی capture و در حافظه تطبیق
+داده می‌شود (سربار ناچیز).
+
 حالت پروسس (هر UDP خروجیِ آن پروسس رله می‌شود، صرف‌نظر از مقصد):
 ```
 relay-client.exe -relay <VPS_IP>:51820 -proc cs2.exe -redundancy 2
@@ -71,13 +80,19 @@ relay-client.exe -relay <VPS_IP>:51820 -proc cs2.exe -redundancy 2
 
 ## ترنسپورت: UDP یا fake-TCP
 
-با `-protocol` لگِ کلاینت↔رله را انتخاب می‌کنی. **هر دو طرف باید یکی باشند.**
+با `-protocol` لگِ کلاینت↔رله را انتخاب می‌کنی. **هر دو طرف باید یکی باشند** —
+مگر اینکه سرور را روی حالت `both` بگذاری (پایین).
 
 - `udp` (پیش‌فرض): مسیر پایدار و تست‌شده.
 - `faketcp`: برای شبکه‌هایی که UDP را کامل بسته‌اند ولی TCP باز است. پکت‌های خام با
   هدر TCP می‌فرستیم که از دید فایروال TCP دیده می‌شوند، ولی رفتارشان datagram است
   (نه retransmission، نه ordering، نه head-of-line blocking) — پس تأثیرش روی پینگ
   تقریباً مثل UDP است.
+- `both` (فقط سرور): UDP و fake-TCP هم‌زمان روی **یک پورت** فعال می‌شوند. چون این دو
+  پروتکل IP متفاوت‌اند (۱۷ و ۶) هیچ تداخلی ندارند. این‌طوری کلاینت می‌تواند هر وقت خواست
+  بین `-protocol udp` و `-protocol faketcp` سوییچ کند و وصل شود، بدون اینکه سرور را عوض کنی.
+  جواب هر کلاینت از همان مسیری که آمده برمی‌گردد. اگر raw socket بالا نیاید (مثلاً non-root)،
+  سرور با هشدار فقط UDP را سرو می‌کند.
 
 ```
 # سرور (root لازم است):
@@ -87,6 +102,15 @@ sudo iptables -A OUTPUT -p tcp --sport 51820 --tcp-flags RST RST -j DROP
 
 # کلاینت (Administrator):
 relay-client.exe -relay <VPS_IP>:51820 -proc cs2.exe -protocol faketcp -redundancy 2
+```
+
+برای اینکه سرور هم‌زمان هر دو را بپذیرد و کلاینت آزادانه سوییچ کند:
+```
+# سرور (root + همان قانون iptables بالا):
+sudo ./relay-server -listen :51820 -protocol both
+# کلاینت هر وقت خواست:
+relay-client.exe -relay <VPS_IP>:51820 -proc cs2.exe -protocol udp
+relay-client.exe -relay <VPS_IP>:51820 -proc cs2.exe -protocol faketcp
 ```
 
 نکات faketcp: سمت سرور raw socket می‌سازد و به دسترسی root (یا `CAP_NET_RAW`) نیاز دارد؛

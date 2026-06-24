@@ -23,7 +23,7 @@ import (
 
 var (
 	listenAddr  = flag.String("listen", ":51820", "address to listen on for client traffic")
-	protocol    = flag.String("protocol", "udp", "client<->relay transport: udp | faketcp")
+	protocol    = flag.String("protocol", "udp", "client<->relay transport: udp | faketcp | both")
 	idleTimeout = flag.Duration("idle", 60*time.Second, "drop a flow after this much silence")
 	redundancy  = flag.Int("redundancy", 1, "send each reply this many times back to the client")
 	dedupSize   = flag.Int("dedup", 4096, "duplicate-detection window per flow")
@@ -35,7 +35,6 @@ type session struct {
 	client    string       // transport token for replies
 	dst       *net.UDPAddr // the game server
 	localPort uint16       // client's original source port (flow id)
-	seqOut    uint32       // sequence counter for replies (for client dedup)
 	dedupIn   *proto.Dedup // drops duplicate copies coming from the client
 	lastSeen  atomic.Int64 // unixnano of last client packet
 }
@@ -45,6 +44,11 @@ type server struct {
 	mu        sync.Mutex
 	sessions  map[string]*session
 }
+
+// globalSeqOut numbers every reply across ALL flows so the client's dedup
+// (which is shared across flows) never sees a collision between two flows
+// that would otherwise both start counting from 1.
+var globalSeqOut uint32
 
 func main() {
 	flag.Parse()
@@ -60,8 +64,10 @@ func main() {
 			log.Fatalf("faketcp needs a numeric port in -listen: %v", perr)
 		}
 		transport, err = newFaketcpServer(port)
+	case "both":
+		transport, err = newMultiTransport(*listenAddr, true)
 	default:
-		log.Fatalf("invalid -protocol %q (use udp or faketcp)", *protocol)
+		log.Fatalf("invalid -protocol %q (use udp, faketcp, or both)", *protocol)
 	}
 	if err != nil {
 		log.Fatalf("open %s transport: %v", *protocol, err)
@@ -158,7 +164,7 @@ func (s *server) readReplies(key string, sess *session) {
 			return // timeout or socket error -> close flow
 		}
 
-		seq := atomic.AddUint32(&sess.seqOut, 1)
+		seq := atomic.AddUint32(&globalSeqOut, 1)
 		out := proto.Encode(&proto.Packet{
 			Flags:     proto.FlagData,
 			Seq:       seq,
