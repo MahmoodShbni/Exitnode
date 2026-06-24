@@ -29,9 +29,10 @@ import (
 	"log"
 	"net"
 	"os"
+	"runtime/debug"
 	"strings"
-	"sync"
 	"sync/atomic"
+	"time"
 
 	"relay/proto"
 
@@ -57,7 +58,10 @@ var (
 	procName   = flag.String("proc", "", "process mode: executable name to capture, e.g. cs2.exe")
 	protocol   = flag.String("protocol", "udp", "client<->relay transport: udp | faketcp")
 	redundancy = flag.Int("redundancy", 2, "send each game packet this many times to the relay")
+	redunDelay = flag.Duration("redundancy-delay", 0, "spacing between redundant copies (e.g. 300us) to survive burst loss")
 	dedupSize  = flag.Int("dedup", 4096, "duplicate-detection window for replies")
+	sockBuf    = flag.Int("sockbuf", 4<<20, "UDP socket read/write buffer in bytes")
+	gogc       = flag.Int("gogc", 300, "GC target percent (higher = fewer GC pauses, more memory)")
 )
 
 // lastIface holds the most recent default outbound interface indices learned
@@ -94,12 +98,22 @@ type flowTemplate struct {
 
 var (
 	seqCounter uint32
-	tmplMu     sync.RWMutex
-	templates  = map[uint16]*flowTemplate{} // keyed by local source port
+	// templates is indexed directly by local source port (uint16): O(1),
+	// lock-free, zero-allocation lookups on the hot path.
+	templates [65536]atomic.Pointer[flowTemplate]
 )
+
+// matches reports whether t already describes this flow (so we can skip
+// reallocating/storing a template on every packet in steady state).
+func (t *flowTemplate) matches(srcIP, dstIP net.IP, dstPort uint16, ifIdx, subIfIdx uint32) bool {
+	return t != nil &&
+		t.gamePort == dstPort && t.ifIdx == ifIdx && t.subIfIdx == subIfIdx &&
+		t.localIP.Equal(srcIP) && t.gameIP.Equal(dstIP)
+}
 
 func main() {
 	flag.Parse()
+	debug.SetGCPercent(*gogc)
 	if *relayAddr == "" {
 		log.Fatal("missing -relay host:port")
 	}
@@ -182,15 +196,43 @@ func main() {
 	defer h.Close()
 
 	dedup := proto.NewDedup(*dedupSize)
+
+	// Decouple sending from capture: the capture loop just hands encoded
+	// frames to a sender goroutine, which does the redundant transmits (with
+	// optional spacing). This keeps the capture path lock- and latency-light.
+	sendCh := make(chan *[]byte, 8192)
+	go senderLoop(transport, sendCh)
+
 	go replyLoop(h, transport, dedup)
-	captureLoop(h, transport, decide)
+	captureLoop(h, transport, decide, sendCh)
 }
 
-// captureLoop reads outbound UDP. Packets the decider accepts are tunneled
-// to the relay; everything else is re-injected unchanged (pass-through).
-func captureLoop(h *divert.Handle, transport relayTransport, decide func(uint16, net.IP) bool) {
+// senderLoop transmits each frame `redundancy` times, optionally spaced out so
+// a burst loss on the path doesn't swallow every copy. Buffers are returned to
+// the pool afterwards.
+func senderLoop(transport relayTransport, sendCh <-chan *[]byte) {
+	for pb := range sendCh {
+		frame := *pb
+		for i := 0; i < *redundancy; i++ {
+			if err := transport.Send(frame); err != nil {
+				log.Printf("to relay: %v", err)
+				break
+			}
+			if i < *redundancy-1 && *redunDelay > 0 {
+				time.Sleep(*redunDelay)
+			}
+		}
+		proto.PutBuf(pb)
+	}
+}
+
+// captureLoop reads outbound UDP. Packets the decider accepts are encoded and
+// handed to the sender; everything else is re-injected unchanged (pass-through).
+func captureLoop(h *divert.Handle, transport relayTransport, decide func(uint16, net.IP) bool, sendCh chan<- *[]byte) {
 	buf := make([]byte, 65535)
 	var addr divert.Address
+	var pkt proto.Packet
+	pkt.Flags = proto.FlagData
 	for {
 		n, err := h.Recv(buf, &addr)
 		if err != nil {
@@ -204,7 +246,7 @@ func captureLoop(h *divert.Handle, transport relayTransport, decide func(uint16,
 			continue
 		}
 		srcPort := binary.BigEndian.Uint16(raw[ihl : ihl+2])
-		dstIP := net.IPv4(raw[16], raw[17], raw[18], raw[19])
+		dstIP := raw[16:20] // 4-byte slice, no allocation
 
 		// Record the default outbound interface for fake-TCP injection.
 		ne := addr.Network()
@@ -218,36 +260,32 @@ func captureLoop(h *divert.Handle, transport relayTransport, decide func(uint16,
 			continue
 		}
 
-		srcIP := net.IPv4(raw[12], raw[13], raw[14], raw[15])
+		srcIP := raw[12:16]
 		dstPort := binary.BigEndian.Uint16(raw[ihl+2 : ihl+4])
 		payload := raw[ihl+8:]
 
-		tmplMu.Lock()
-		templates[srcPort] = &flowTemplate{
-			localIP:   srcIP,
-			localPort: srcPort,
-			gameIP:    dstIP,
-			gamePort:  dstPort,
-			ifIdx:     ne.InterfaceIndex,
-			subIfIdx:  ne.SubInterfaceIndex,
+		// Update the flow template only when it actually changes, so steady
+		// state allocates nothing.
+		if cur := templates[srcPort].Load(); !cur.matches(srcIP, dstIP, dstPort, ne.InterfaceIndex, ne.SubInterfaceIndex) {
+			templates[srcPort].Store(&flowTemplate{
+				localIP:   append(net.IP(nil), srcIP...),
+				localPort: srcPort,
+				gameIP:    append(net.IP(nil), dstIP...),
+				gamePort:  dstPort,
+				ifIdx:     ne.InterfaceIndex,
+				subIfIdx:  ne.SubInterfaceIndex,
+			})
 		}
-		tmplMu.Unlock()
 
-		seq := atomic.AddUint32(&seqCounter, 1)
-		enc := proto.Encode(&proto.Packet{
-			Flags:     proto.FlagData,
-			Seq:       seq,
-			Addr:      dstIP,
-			Port:      dstPort,
-			LocalPort: srcPort,
-			Payload:   payload,
-		})
-		for i := 0; i < *redundancy; i++ {
-			if err := transport.Send(enc); err != nil {
-				log.Printf("to relay: %v", err)
-				break
-			}
-		}
+		pkt.Seq = atomic.AddUint32(&seqCounter, 1)
+		pkt.Addr = dstIP
+		pkt.Port = dstPort
+		pkt.LocalPort = srcPort
+		pkt.Payload = payload
+
+		pb := proto.GetBuf()
+		*pb = proto.EncodeInto(*pb, &pkt)
+		sendCh <- pb // sender does the redundant transmits; returns buf to pool
 		// Original is dropped (not re-sent): the relay delivers it.
 	}
 }
@@ -255,30 +293,29 @@ func captureLoop(h *divert.Handle, transport relayTransport, decide func(uint16,
 // replyLoop reads encapsulated replies and injects them as inbound.
 func replyLoop(h *divert.Handle, transport relayTransport, dedup *proto.Dedup) {
 	buf := make([]byte, 65535)
+	var pkt proto.Packet
+	var a divert.Address
 	for {
 		n, err := transport.Recv(buf)
 		if err != nil {
 			log.Printf("from relay: %v", err)
 			continue
 		}
-		pkt, err := proto.Decode(buf[:n])
-		if err != nil {
+		if err := proto.DecodeInto(buf[:n], &pkt); err != nil {
 			continue
 		}
 		if dedup.Seen(pkt.Seq) {
 			continue
 		}
 
-		tmplMu.RLock()
-		tmpl := templates[pkt.LocalPort]
-		tmplMu.RUnlock()
+		tmpl := templates[pkt.LocalPort].Load()
 		if tmpl == nil {
 			continue
 		}
 
-		raw := buildInbound(tmpl, pkt.Payload)
+		pb := proto.GetBuf()
+		*pb = buildInboundInto((*pb)[:cap(*pb)], tmpl, pkt.Payload)
 
-		var a divert.Address
 		a.SetLayer(divert.LayerNetwork)
 		a.SetEvent(divert.EventNetworkPacket)
 		// Inbound (Outbound bit cleared); checksums are valid in-packet.
@@ -287,19 +324,29 @@ func replyLoop(h *divert.Handle, transport relayTransport, dedup *proto.Dedup) {
 		ne.InterfaceIndex = tmpl.ifIdx
 		ne.SubInterfaceIndex = tmpl.subIfIdx
 
-		if _, err := h.Send(raw, &a); err != nil {
+		if _, err := h.Send(*pb, &a); err != nil {
 			log.Printf("inject: %v", err)
 		}
+		proto.PutBuf(pb)
 	}
 }
 
 // buildInbound crafts an IPv4+UDP packet that looks like it came FROM the
 // game server TO the local client, carrying payload, with valid checksums.
 func buildInbound(t *flowTemplate, payload []byte) []byte {
+	return buildInboundInto(make([]byte, 28+len(payload)), t, payload)
+}
+
+// buildInboundInto writes the packet into dst (reusing its array when large
+// enough) and returns the filled slice.
+func buildInboundInto(dst []byte, t *flowTemplate, payload []byte) []byte {
 	const ihl = 20
 	udpLen := 8 + len(payload)
 	total := ihl + udpLen
-	b := make([]byte, total)
+	if cap(dst) < total {
+		dst = make([]byte, total)
+	}
+	b := dst[:total]
 
 	// IPv4 header
 	b[0] = 0x45

@@ -5,15 +5,17 @@
 //	client --(encapsulated)--> relay --(raw UDP)--> game server
 //	client <--(encapsulated)-- relay <--(raw UDP)-- game server
 //
-// The client<->relay leg can be plain UDP (default) or fake-TCP
-// (-protocol faketcp) for networks that block UDP. The relay<->game leg is
-// always real UDP.
+// The client<->relay leg can be plain UDP (default), fake-TCP, or both. The
+// relay<->game leg is always real UDP.
 package main
 
 import (
 	"flag"
 	"log"
 	"net"
+	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,38 +28,59 @@ var (
 	protocol    = flag.String("protocol", "udp", "client<->relay transport: udp | faketcp | both")
 	idleTimeout = flag.Duration("idle", 60*time.Second, "drop a flow after this much silence")
 	redundancy  = flag.Int("redundancy", 1, "send each reply this many times back to the client")
+	redunDelay  = flag.Duration("redundancy-delay", 0, "spacing between redundant reply copies (e.g. 300us) to survive burst loss")
 	dedupSize   = flag.Int("dedup", 4096, "duplicate-detection window per flow")
+	sockBuf     = flag.Int("sockbuf", 4<<20, "per-socket read/write buffer in bytes")
+	gogc        = flag.Int("gogc", 300, "GC target percent (higher = fewer GC pauses, more memory)")
+	batch       = flag.Bool("batch", false, "Linux: read datagrams in batches via recvmmsg (helps many concurrent users)")
 )
 
 // session represents one game flow: a unique (client, dst, localPort) triple.
 type session struct {
 	conn      *net.UDPConn // connected socket to the real game server
+	clientMu  sync.Mutex   // guards client (updated on rebind, read on reply)
 	client    string       // transport token for replies
-	dst       *net.UDPAddr // the game server
+	dst       *net.UDPAddr // the game server (owns its IP bytes)
 	localPort uint16       // client's original source port (flow id)
 	dedupIn   *proto.Dedup // drops duplicate copies coming from the client
 	lastSeen  atomic.Int64 // unixnano of last client packet
 }
 
+func (s *session) setClient(c string) {
+	s.clientMu.Lock()
+	s.client = c
+	s.clientMu.Unlock()
+}
+
+func (s *session) getClient() string {
+	s.clientMu.Lock()
+	c := s.client
+	s.clientMu.Unlock()
+	return c
+}
+
 type server struct {
 	transport serverTransport
-	mu        sync.Mutex
-	sessions  map[string]*session
+	sessions  sync.Map // key string -> *session (lock-free hot-path lookups)
 }
 
 // globalSeqOut numbers every reply across ALL flows so the client's dedup
-// (which is shared across flows) never sees a collision between two flows
-// that would otherwise both start counting from 1.
+// (shared across flows) never sees a collision between two flows.
 var globalSeqOut uint32
 
 func main() {
 	flag.Parse()
+	debug.SetGCPercent(*gogc)
 
 	var transport serverTransport
 	var err error
 	switch *protocol {
 	case "udp":
-		transport, err = newUDPTransport(*listenAddr)
+		if *batch {
+			transport, err = newBatchUDPTransport(*listenAddr, *sockBuf)
+		} else {
+			transport, err = newUDPTransport(*listenAddr)
+		}
 	case "faketcp":
 		port, perr := portOf(*listenAddr)
 		if perr != nil {
@@ -74,7 +97,7 @@ func main() {
 	}
 	defer transport.Close()
 
-	s := &server{transport: transport, sessions: make(map[string]*session)}
+	s := &server{transport: transport}
 	go s.janitor()
 
 	log.Printf("relay listening on %s (%s)", *listenAddr, *protocol)
@@ -82,21 +105,19 @@ func main() {
 }
 
 func (s *server) loop() {
+	var pkt proto.Packet // reused; DecodeInto writes into it without allocating
 	for {
 		frame, client, err := s.transport.Recv()
 		if err != nil {
 			log.Printf("recv: %v", err)
 			continue
 		}
-		pkt, err := proto.Decode(frame)
-		if err != nil {
+		if err := proto.DecodeInto(frame, &pkt); err != nil {
 			continue // not ours / garbage
 		}
 
-		dst := &net.UDPAddr{IP: pkt.Addr, Port: int(pkt.Port)}
-		key := client + "|" + dst.String() + "|" + itoa(pkt.LocalPort)
-
-		sess := s.getOrCreate(key, client, dst, pkt.LocalPort)
+		key := flowKey(client, pkt.Addr, pkt.Port, pkt.LocalPort)
+		sess := s.getOrCreate(key, client, pkt.Addr, pkt.Port, pkt.LocalPort)
 		if sess == nil {
 			continue
 		}
@@ -106,27 +127,32 @@ func (s *server) loop() {
 		if sess.dedupIn.Seen(pkt.Seq) {
 			continue
 		}
-
 		if _, err := sess.conn.Write(pkt.Payload); err != nil {
-			log.Printf("forward to %s: %v", dst, err)
+			log.Printf("forward: %v", err)
 		}
 	}
 }
 
-func (s *server) getOrCreate(key, client string, dst *net.UDPAddr, localPort uint16) *session {
-	s.mu.Lock()
-	if sess, ok := s.sessions[key]; ok {
-		sess.client = client // keep reply route fresh
-		s.mu.Unlock()
+func (s *server) getOrCreate(key, client string, ip net.IP, port, localPort uint16) *session {
+	if v, ok := s.sessions.Load(key); ok {
+		sess := v.(*session)
+		sess.setClient(client) // keep reply route fresh on NAT rebind
 		return sess
 	}
-	s.mu.Unlock()
+
+	// Clone the destination IP: pkt.Addr aliases a reused decode buffer.
+	ipc := make(net.IP, 4)
+	copy(ipc, ip.To4())
+	dst := &net.UDPAddr{IP: ipc, Port: int(port)}
 
 	conn, err := net.DialUDP("udp", nil, dst)
 	if err != nil {
 		log.Printf("dial %s: %v", dst, err)
 		return nil
 	}
+	// Generous socket buffers so bursts are not dropped by the kernel.
+	_ = conn.SetReadBuffer(*sockBuf)
+	_ = conn.SetWriteBuffer(*sockBuf)
 
 	sess := &session{
 		conn:      conn,
@@ -137,9 +163,12 @@ func (s *server) getOrCreate(key, client string, dst *net.UDPAddr, localPort uin
 	}
 	sess.lastSeen.Store(time.Now().UnixNano())
 
-	s.mu.Lock()
-	s.sessions[key] = sess
-	s.mu.Unlock()
+	// LoadOrStore guards against a rare duplicate create (loop is single
+	// goroutine, but be safe).
+	if actual, loaded := s.sessions.LoadOrStore(key, sess); loaded {
+		conn.Close()
+		return actual.(*session)
+	}
 
 	go s.readReplies(key, sess)
 	log.Printf("new flow %s -> %s (localPort %d)", client, dst, localPort)
@@ -150,13 +179,17 @@ func (s *server) getOrCreate(key, client string, dst *net.UDPAddr, localPort uin
 func (s *server) readReplies(key string, sess *session) {
 	defer func() {
 		sess.conn.Close()
-		s.mu.Lock()
-		delete(s.sessions, key)
-		s.mu.Unlock()
+		s.sessions.Delete(key)
 		log.Printf("closed flow %s", key)
 	}()
 
 	buf := make([]byte, 65535)
+	var reply proto.Packet
+	reply.Flags = proto.FlagData
+	reply.Addr = sess.dst.IP
+	reply.Port = uint16(sess.dst.Port)
+	reply.LocalPort = sess.localPort
+
 	for {
 		_ = sess.conn.SetReadDeadline(time.Now().Add(*idleTimeout))
 		n, err := sess.conn.Read(buf)
@@ -164,23 +197,22 @@ func (s *server) readReplies(key string, sess *session) {
 			return // timeout or socket error -> close flow
 		}
 
-		seq := atomic.AddUint32(&globalSeqOut, 1)
-		out := proto.Encode(&proto.Packet{
-			Flags:     proto.FlagData,
-			Seq:       seq,
-			Addr:      sess.dst.IP,
-			Port:      uint16(sess.dst.Port),
-			LocalPort: sess.localPort,
-			Payload:   buf[:n],
-		})
+		reply.Seq = atomic.AddUint32(&globalSeqOut, 1)
+		reply.Payload = buf[:n]
 
-		// Send R copies back; the client dedups by seq.
+		pb := proto.GetBuf()
+		*pb = proto.EncodeInto(*pb, &reply)
+		client := sess.getClient()
 		for i := 0; i < *redundancy; i++ {
-			if err := s.transport.Send(out, sess.client); err != nil {
-				log.Printf("reply to %s: %v", sess.client, err)
+			if err := s.transport.Send(*pb, client); err != nil {
+				log.Printf("reply: %v", err)
 				break
 			}
+			if i < *redundancy-1 && *redunDelay > 0 {
+				time.Sleep(*redunDelay)
+			}
 		}
+		proto.PutBuf(pb)
 	}
 }
 
@@ -189,30 +221,28 @@ func (s *server) janitor() {
 	defer t.Stop()
 	for range t.C {
 		cutoff := time.Now().Add(-*idleTimeout).UnixNano()
-		s.mu.Lock()
-		for k, sess := range s.sessions {
+		s.sessions.Range(func(_, v any) bool {
+			sess := v.(*session)
 			if sess.lastSeen.Load() < cutoff {
-				sess.conn.SetReadDeadline(time.Now()) // unblock reader
-				delete(s.sessions, k)
+				sess.conn.SetReadDeadline(time.Now()) // unblock reader -> it cleans up
 			}
-		}
-		s.mu.Unlock()
+			return true
+		})
 	}
 }
 
-func itoa(v uint16) string {
-	const digits = "0123456789"
-	if v == 0 {
-		return "0"
-	}
-	var b [5]byte
-	i := len(b)
-	for v > 0 {
-		i--
-		b[i] = digits[v%10]
-		v /= 10
-	}
-	return string(b[i:])
+// flowKey builds the session key with a single allocation.
+func flowKey(client string, ip net.IP, port, localPort uint16) string {
+	var b strings.Builder
+	b.Grow(len(client) + 32)
+	b.WriteString(client)
+	b.WriteByte('|')
+	b.WriteString(ip.String())
+	b.WriteByte(':')
+	b.WriteString(strconv.Itoa(int(port)))
+	b.WriteByte('|')
+	b.WriteString(strconv.Itoa(int(localPort)))
+	return b.String()
 }
 
 // portOf extracts the numeric port from a "host:port" or ":port" string.

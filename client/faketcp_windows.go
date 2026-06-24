@@ -8,8 +8,10 @@ import (
 	"math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"relay/proto"
 	"relay/tcpip"
 
 	divert "github.com/imgk/divert-go"
@@ -40,9 +42,10 @@ type faketcpClient struct {
 	theirSeq    uint32 // next expected seq from relay (our ack)
 	established bool
 
-	estCh    chan struct{}
-	estOnce  sync.Once
-	incoming chan []byte
+	estCh      chan struct{}
+	estOnce    sync.Once
+	incoming   chan *[]byte // pooled payload buffers
+	pendingAck atomic.Bool  // a data ACK is due (coalesced by ackLoop)
 }
 
 // ifaceProvider returns the current default outbound interface indices,
@@ -82,10 +85,11 @@ func newFaketcpClient(relayIP net.IP, relayPort uint16, getIface ifaceProvider) 
 		getIface:  getIface,
 		synSeq:    rand.Uint32(),
 		estCh:     make(chan struct{}),
-		incoming:  make(chan []byte, 1024),
+		incoming:  make(chan *[]byte, 8192),
 	}
 	go t.readLoop()
 	go t.handshakeLoop()
+	go t.ackLoop()
 	return t, nil
 }
 
@@ -177,15 +181,17 @@ func (t *faketcpClient) readLoop() {
 				if tcpip.SeqGT(next, t.theirSeq) {
 					t.theirSeq = next
 				}
-				ack := t.theirSeq
-				seq := t.ourSeq
 				t.mu.Unlock()
-				_ = t.inject(seq, ack, tcpip.FlagACK, nil) // bare ACK
-				cp := make([]byte, len(seg.Payload))
-				copy(cp, seg.Payload)
+				// Coalesce ACKs: mark one due; ackLoop sends a single ACK
+				// per tick instead of one per packet (less handle contention).
+				t.pendingAck.Store(true)
+
+				pb := proto.GetBuf()
+				*pb = append((*pb)[:0], seg.Payload...)
 				select {
-				case t.incoming <- cp:
+				case t.incoming <- pb:
 				default: // drop if backed up
+					proto.PutBuf(pb)
 				}
 				t.markEstablished()
 			}
@@ -215,11 +221,30 @@ func (t *faketcpClient) Send(frame []byte) error {
 }
 
 func (t *faketcpClient) Recv(buf []byte) (int, error) {
-	frame, ok := <-t.incoming
+	pb, ok := <-t.incoming
 	if !ok {
 		return 0, errors.New("faketcp: closed")
 	}
-	return copy(buf, frame), nil
+	n := copy(buf, *pb)
+	proto.PutBuf(pb)
+	return n, nil
+}
+
+// ackLoop sends at most one coalesced ACK per tick when data has arrived,
+// instead of acking every packet (which would hammer the WinDivert handle).
+func (t *faketcpClient) ackLoop() {
+	tk := time.NewTicker(10 * time.Millisecond)
+	defer tk.Stop()
+	for range tk.C {
+		if !t.pendingAck.CompareAndSwap(true, false) {
+			continue
+		}
+		t.mu.Lock()
+		seq := t.ourSeq
+		ack := t.theirSeq
+		t.mu.Unlock()
+		_ = t.inject(seq, ack, tcpip.FlagACK, nil)
+	}
 }
 
 func (t *faketcpClient) Close() error {
