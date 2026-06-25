@@ -61,7 +61,7 @@ var (
 	redunDelay = flag.Duration("redundancy-delay", 0, "spacing between redundant copies (e.g. 300us) to survive burst loss")
 	dedupSize  = flag.Int("dedup", 4096, "duplicate-detection window for replies")
 	sockBuf    = flag.Int("sockbuf", 4<<20, "UDP socket read/write buffer in bytes")
-	gogc       = flag.Int("gogc", 300, "GC target percent (higher = fewer GC pauses, more memory)")
+	gogc       = flag.Int("gogc", 100, "GC target percent (higher = fewer GC pauses, more memory)")
 )
 
 // lastIface holds the most recent default outbound interface indices learned
@@ -196,39 +196,14 @@ func main() {
 	defer h.Close()
 
 	dedup := proto.NewDedup(*dedupSize)
-
-	// Decouple sending from capture: the capture loop just hands encoded
-	// frames to a sender goroutine, which does the redundant transmits (with
-	// optional spacing). This keeps the capture path lock- and latency-light.
-	sendCh := make(chan *[]byte, 8192)
-	go senderLoop(transport, sendCh)
-
 	go replyLoop(h, transport, dedup)
-	captureLoop(h, transport, decide, sendCh)
-}
-
-// senderLoop transmits each frame `redundancy` times, optionally spaced out so
-// a burst loss on the path doesn't swallow every copy. Buffers are returned to
-// the pool afterwards.
-func senderLoop(transport relayTransport, sendCh <-chan *[]byte) {
-	for pb := range sendCh {
-		frame := *pb
-		for i := 0; i < *redundancy; i++ {
-			if err := transport.Send(frame); err != nil {
-				log.Printf("to relay: %v", err)
-				break
-			}
-			if i < *redundancy-1 && *redunDelay > 0 {
-				time.Sleep(*redunDelay)
-			}
-		}
-		proto.PutBuf(pb)
-	}
+	captureLoop(h, transport, decide)
 }
 
 // captureLoop reads outbound UDP. Packets the decider accepts are encoded and
-// handed to the sender; everything else is re-injected unchanged (pass-through).
-func captureLoop(h *divert.Handle, transport relayTransport, decide func(uint16, net.IP) bool, sendCh chan<- *[]byte) {
+// sent straight to the relay (synchronously, lowest latency); everything else
+// is re-injected unchanged (pass-through).
+func captureLoop(h *divert.Handle, transport relayTransport, decide func(uint16, net.IP) bool) {
 	buf := make([]byte, 65535)
 	var addr divert.Address
 	var pkt proto.Packet
@@ -285,7 +260,19 @@ func captureLoop(h *divert.Handle, transport relayTransport, decide func(uint16,
 
 		pb := proto.GetBuf()
 		*pb = proto.EncodeInto(*pb, &pkt)
-		sendCh <- pb // sender does the redundant transmits; returns buf to pool
+		// Send redundant copies immediately in this goroutine. With
+		// -redundancy-delay 0 (default) this matches the original low-latency
+		// behavior; a non-zero delay spaces copies to survive burst loss.
+		for i := 0; i < *redundancy; i++ {
+			if err := transport.Send(*pb); err != nil {
+				log.Printf("to relay: %v", err)
+				break
+			}
+			if i < *redundancy-1 && *redunDelay > 0 {
+				time.Sleep(*redunDelay)
+			}
+		}
+		proto.PutBuf(pb)
 		// Original is dropped (not re-sent): the relay delivers it.
 	}
 }

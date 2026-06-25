@@ -31,7 +31,7 @@ var (
 	redunDelay  = flag.Duration("redundancy-delay", 0, "spacing between redundant reply copies (e.g. 300us) to survive burst loss")
 	dedupSize   = flag.Int("dedup", 4096, "duplicate-detection window per flow")
 	sockBuf     = flag.Int("sockbuf", 4<<20, "per-socket read/write buffer in bytes")
-	gogc        = flag.Int("gogc", 300, "GC target percent (higher = fewer GC pauses, more memory)")
+	gogc        = flag.Int("gogc", 100, "GC target percent (higher = fewer GC pauses, more memory)")
 	batch       = flag.Bool("batch", false, "Linux: read datagrams in batches via recvmmsg (helps many concurrent users)")
 )
 
