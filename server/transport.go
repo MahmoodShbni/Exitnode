@@ -33,8 +33,8 @@ func newUDPTransport(listen string) (*udpTransport, error) {
 	if err != nil {
 		return nil, err
 	}
-	_ = conn.SetReadBuffer(*sockBuf)
-	_ = conn.SetWriteBuffer(*sockBuf)
+	_ = conn.SetReadBuffer(4 << 20)
+	_ = conn.SetWriteBuffer(4 << 20)
 	return &udpTransport{conn: conn, addr: make(map[string]*net.UDPAddr)}, nil
 }
 

@@ -5,17 +5,13 @@
 package proto
 
 import (
+	"encoding/binary"
 	"errors"
 	"net"
 )
 
 // Magic marks our packets so the relay can ignore stray UDP noise.
 const Magic uint16 = 0xE1A6
-
-var (
-	errShort = errors.New("proto: packet too short")
-	errMagic = errors.New("proto: bad magic")
-)
 
 // Flags
 const (
@@ -43,21 +39,40 @@ type Packet struct {
 	Port      uint16
 	LocalPort uint16
 	Payload   []byte
-
-	addrBuf [4]byte // backing array for Addr in DecodeInto (avoids alloc)
 }
 
 // Encode serializes p into a freshly allocated buffer.
 func Encode(p *Packet) []byte {
-	return EncodeInto(make([]byte, HeaderSize+len(p.Payload)), p)
+	buf := make([]byte, HeaderSize+len(p.Payload))
+	binary.BigEndian.PutUint16(buf[0:2], Magic)
+	buf[2] = p.Flags
+	binary.BigEndian.PutUint32(buf[3:7], p.Seq)
+	ip4 := p.Addr.To4()
+	if ip4 == nil {
+		ip4 = net.IPv4zero.To4()
+	}
+	copy(buf[7:11], ip4)
+	binary.BigEndian.PutUint16(buf[11:13], p.Port)
+	binary.BigEndian.PutUint16(buf[13:15], p.LocalPort)
+	copy(buf[HeaderSize:], p.Payload)
+	return buf
 }
 
-// Decode parses a buffer into a freshly allocated Packet. The returned
-// Payload aliases the input slice.
+// Decode parses a buffer. The returned Payload aliases the input slice,
+// so copy it if you need to retain it past the next read.
 func Decode(buf []byte) (*Packet, error) {
-	p := &Packet{}
-	if err := DecodeInto(buf, p); err != nil {
-		return nil, err
+	if len(buf) < HeaderSize {
+		return nil, errors.New("proto: packet too short")
 	}
-	return p, nil
+	if binary.BigEndian.Uint16(buf[0:2]) != Magic {
+		return nil, errors.New("proto: bad magic")
+	}
+	return &Packet{
+		Flags:     buf[2],
+		Seq:       binary.BigEndian.Uint32(buf[3:7]),
+		Addr:      net.IPv4(buf[7], buf[8], buf[9], buf[10]),
+		Port:      binary.BigEndian.Uint16(buf[11:13]),
+		LocalPort: binary.BigEndian.Uint16(buf[13:15]),
+		Payload:   buf[HeaderSize:],
+	}, nil
 }
